@@ -117,6 +117,7 @@ var Inputs;
     Inputs["Title"] = "title";
     Inputs["Path"] = "path";
     Inputs["Token"] = "token";
+    Inputs["FailOnViolation"] = "fail-on-violation";
 })(Inputs || (exports.Inputs = Inputs = {}));
 
 
@@ -190,6 +191,9 @@ function run() {
             const path = core.getInput(constants_1.Inputs.Path, { required: true });
             const name = core.getInput(constants_1.Inputs.Name);
             const title = core.getInput(constants_1.Inputs.Title);
+            const failOnViolations = core.getBooleanInput(constants_1.Inputs.FailOnViolation, {
+                required: false
+            });
             const searchResult = yield (0, search_1.findResults)(path);
             if (searchResult.filesToUpload.length === 0) {
                 core.warning(`No files were found for the provided path: ${path}. No results will be uploaded.`);
@@ -204,7 +208,7 @@ function run() {
                     : [annotations];
                 core.debug(`Created ${groupedAnnotations.length} buckets`);
                 for (const annotationSet of groupedAnnotations) {
-                    yield createCheck(name, title, annotationSet, annotations.length);
+                    yield createCheck(name, title, annotationSet, annotations.length, failOnViolations);
                 }
             }
         }
@@ -213,7 +217,7 @@ function run() {
         }
     });
 }
-function createCheck(name, title, annotations, numErrors) {
+function createCheck(name, title, annotations, numErrors, failOnViolations) {
     return __awaiter(this, void 0, void 0, function* () {
         const octokit = (0, github_1.getOctokit)(core.getInput(constants_1.Inputs.Token));
         let sha = github_1.context.sha;
@@ -224,7 +228,11 @@ function createCheck(name, title, annotations, numErrors) {
         const res = yield octokit.rest.checks.listForRef(req);
         const existingCheckRun = res.data.check_runs.find(check => check.name === name);
         if (!existingCheckRun) {
-            const createRequest = Object.assign(Object.assign({}, github_1.context.repo), { head_sha: sha, name, status: 'completed', conclusion: numErrors === 0 ? 'success' : 'neutral', output: {
+            const createRequest = Object.assign(Object.assign({}, github_1.context.repo), { head_sha: sha, name, status: 'completed', conclusion: numErrors === 0
+                    ? 'success'
+                    : failOnViolations
+                        ? 'failure'
+                        : 'neutral', output: {
                     title,
                     summary: `${numErrors} violation(s) found`,
                     annotations
@@ -233,7 +241,11 @@ function createCheck(name, title, annotations, numErrors) {
         }
         else {
             const check_run_id = existingCheckRun.id;
-            const update_req = Object.assign(Object.assign({}, github_1.context.repo), { check_run_id, status: 'completed', conclusion: 'neutral', output: {
+            const update_req = Object.assign(Object.assign({}, github_1.context.repo), { check_run_id, status: 'completed', conclusion: numErrors === 0
+                    ? 'success'
+                    : failOnViolations
+                        ? 'failure'
+                        : 'neutral', output: {
                     title,
                     summary: `${numErrors} violation(s) found`,
                     annotations
@@ -3622,1428 +3634,6 @@ function isLoopbackAddress(host) {
 
 /***/ }),
 
-/***/ 2856:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-const WritableStream = (__nccwpck_require__(84492).Writable)
-const inherits = (__nccwpck_require__(47261).inherits)
-
-const StreamSearch = __nccwpck_require__(88534)
-
-const PartStream = __nccwpck_require__(38710)
-const HeaderParser = __nccwpck_require__(90333)
-
-const DASH = 45
-const B_ONEDASH = Buffer.from('-')
-const B_CRLF = Buffer.from('\r\n')
-const EMPTY_FN = function () {}
-
-function Dicer (cfg) {
-  if (!(this instanceof Dicer)) { return new Dicer(cfg) }
-  WritableStream.call(this, cfg)
-
-  if (!cfg || (!cfg.headerFirst && typeof cfg.boundary !== 'string')) { throw new TypeError('Boundary required') }
-
-  if (typeof cfg.boundary === 'string') { this.setBoundary(cfg.boundary) } else { this._bparser = undefined }
-
-  this._headerFirst = cfg.headerFirst
-
-  this._dashes = 0
-  this._parts = 0
-  this._finished = false
-  this._realFinish = false
-  this._isPreamble = true
-  this._justMatched = false
-  this._firstWrite = true
-  this._inHeader = true
-  this._part = undefined
-  this._cb = undefined
-  this._ignoreData = false
-  this._partOpts = { highWaterMark: cfg.partHwm }
-  this._pause = false
-
-  const self = this
-  this._hparser = new HeaderParser(cfg)
-  this._hparser.on('header', function (header) {
-    self._inHeader = false
-    self._part.emit('header', header)
-  })
-}
-inherits(Dicer, WritableStream)
-
-Dicer.prototype.emit = function (ev) {
-  if (ev === 'finish' && !this._realFinish) {
-    if (!this._finished) {
-      const self = this
-      process.nextTick(function () {
-        self.emit('error', new Error('Unexpected end of multipart data'))
-        if (self._part && !self._ignoreData) {
-          const type = (self._isPreamble ? 'Preamble' : 'Part')
-          self._part.emit('error', new Error(type + ' terminated early due to unexpected end of multipart data'))
-          self._part.push(null)
-          process.nextTick(function () {
-            self._realFinish = true
-            self.emit('finish')
-            self._realFinish = false
-          })
-          return
-        }
-        self._realFinish = true
-        self.emit('finish')
-        self._realFinish = false
-      })
-    }
-  } else { WritableStream.prototype.emit.apply(this, arguments) }
-}
-
-Dicer.prototype._write = function (data, encoding, cb) {
-  // ignore unexpected data (e.g. extra trailer data after finished)
-  if (!this._hparser && !this._bparser) { return cb() }
-
-  if (this._headerFirst && this._isPreamble) {
-    if (!this._part) {
-      this._part = new PartStream(this._partOpts)
-      if (this._events.preamble) { this.emit('preamble', this._part) } else { this._ignore() }
-    }
-    const r = this._hparser.push(data)
-    if (!this._inHeader && r !== undefined && r < data.length) { data = data.slice(r) } else { return cb() }
-  }
-
-  // allows for "easier" testing
-  if (this._firstWrite) {
-    this._bparser.push(B_CRLF)
-    this._firstWrite = false
-  }
-
-  this._bparser.push(data)
-
-  if (this._pause) { this._cb = cb } else { cb() }
-}
-
-Dicer.prototype.reset = function () {
-  this._part = undefined
-  this._bparser = undefined
-  this._hparser = undefined
-}
-
-Dicer.prototype.setBoundary = function (boundary) {
-  const self = this
-  this._bparser = new StreamSearch('\r\n--' + boundary)
-  this._bparser.on('info', function (isMatch, data, start, end) {
-    self._oninfo(isMatch, data, start, end)
-  })
-}
-
-Dicer.prototype._ignore = function () {
-  if (this._part && !this._ignoreData) {
-    this._ignoreData = true
-    this._part.on('error', EMPTY_FN)
-    // we must perform some kind of read on the stream even though we are
-    // ignoring the data, otherwise node's Readable stream will not emit 'end'
-    // after pushing null to the stream
-    this._part.resume()
-  }
-}
-
-Dicer.prototype._oninfo = function (isMatch, data, start, end) {
-  let buf; const self = this; let i = 0; let r; let shouldWriteMore = true
-
-  if (!this._part && this._justMatched && data) {
-    while (this._dashes < 2 && (start + i) < end) {
-      if (data[start + i] === DASH) {
-        ++i
-        ++this._dashes
-      } else {
-        if (this._dashes) { buf = B_ONEDASH }
-        this._dashes = 0
-        break
-      }
-    }
-    if (this._dashes === 2) {
-      if ((start + i) < end && this._events.trailer) { this.emit('trailer', data.slice(start + i, end)) }
-      this.reset()
-      this._finished = true
-      // no more parts will be added
-      if (self._parts === 0) {
-        self._realFinish = true
-        self.emit('finish')
-        self._realFinish = false
-      }
-    }
-    if (this._dashes) { return }
-  }
-  if (this._justMatched) { this._justMatched = false }
-  if (!this._part) {
-    this._part = new PartStream(this._partOpts)
-    this._part._read = function (n) {
-      self._unpause()
-    }
-    if (this._isPreamble && this._events.preamble) { this.emit('preamble', this._part) } else if (this._isPreamble !== true && this._events.part) { this.emit('part', this._part) } else { this._ignore() }
-    if (!this._isPreamble) { this._inHeader = true }
-  }
-  if (data && start < end && !this._ignoreData) {
-    if (this._isPreamble || !this._inHeader) {
-      if (buf) { shouldWriteMore = this._part.push(buf) }
-      shouldWriteMore = this._part.push(data.slice(start, end))
-      if (!shouldWriteMore) { this._pause = true }
-    } else if (!this._isPreamble && this._inHeader) {
-      if (buf) { this._hparser.push(buf) }
-      r = this._hparser.push(data.slice(start, end))
-      if (!this._inHeader && r !== undefined && r < end) { this._oninfo(false, data, start + r, end) }
-    }
-  }
-  if (isMatch) {
-    this._hparser.reset()
-    if (this._isPreamble) { this._isPreamble = false } else {
-      if (start !== end) {
-        ++this._parts
-        this._part.on('end', function () {
-          if (--self._parts === 0) {
-            if (self._finished) {
-              self._realFinish = true
-              self.emit('finish')
-              self._realFinish = false
-            } else {
-              self._unpause()
-            }
-          }
-        })
-      }
-    }
-    this._part.push(null)
-    this._part = undefined
-    this._ignoreData = false
-    this._justMatched = true
-    this._dashes = 0
-  }
-}
-
-Dicer.prototype._unpause = function () {
-  if (!this._pause) { return }
-
-  this._pause = false
-  if (this._cb) {
-    const cb = this._cb
-    this._cb = undefined
-    cb()
-  }
-}
-
-module.exports = Dicer
-
-
-/***/ }),
-
-/***/ 90333:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-const EventEmitter = (__nccwpck_require__(15673).EventEmitter)
-const inherits = (__nccwpck_require__(47261).inherits)
-const getLimit = __nccwpck_require__(49692)
-
-const StreamSearch = __nccwpck_require__(88534)
-
-const B_DCRLF = Buffer.from('\r\n\r\n')
-const RE_CRLF = /\r\n/g
-const RE_HDR = /^([^:]+):[ \t]?([\x00-\xFF]+)?$/ // eslint-disable-line no-control-regex
-
-function HeaderParser (cfg) {
-  EventEmitter.call(this)
-
-  cfg = cfg || {}
-  const self = this
-  this.nread = 0
-  this.maxed = false
-  this.npairs = 0
-  this.maxHeaderPairs = getLimit(cfg, 'maxHeaderPairs', 2000)
-  this.maxHeaderSize = getLimit(cfg, 'maxHeaderSize', 80 * 1024)
-  this.buffer = ''
-  this.header = {}
-  this.finished = false
-  this.ss = new StreamSearch(B_DCRLF)
-  this.ss.on('info', function (isMatch, data, start, end) {
-    if (data && !self.maxed) {
-      if (self.nread + end - start >= self.maxHeaderSize) {
-        end = self.maxHeaderSize - self.nread + start
-        self.nread = self.maxHeaderSize
-        self.maxed = true
-      } else { self.nread += (end - start) }
-
-      self.buffer += data.toString('binary', start, end)
-    }
-    if (isMatch) { self._finish() }
-  })
-}
-inherits(HeaderParser, EventEmitter)
-
-HeaderParser.prototype.push = function (data) {
-  const r = this.ss.push(data)
-  if (this.finished) { return r }
-}
-
-HeaderParser.prototype.reset = function () {
-  this.finished = false
-  this.buffer = ''
-  this.header = {}
-  this.ss.reset()
-}
-
-HeaderParser.prototype._finish = function () {
-  if (this.buffer) { this._parseHeader() }
-  this.ss.matches = this.ss.maxMatches
-  const header = this.header
-  this.header = {}
-  this.buffer = ''
-  this.finished = true
-  this.nread = this.npairs = 0
-  this.maxed = false
-  this.emit('header', header)
-}
-
-HeaderParser.prototype._parseHeader = function () {
-  if (this.npairs === this.maxHeaderPairs) { return }
-
-  const lines = this.buffer.split(RE_CRLF)
-  const len = lines.length
-  let m, h
-
-  for (var i = 0; i < len; ++i) { // eslint-disable-line no-var
-    if (lines[i].length === 0) { continue }
-    if (lines[i][0] === '\t' || lines[i][0] === ' ') {
-      // folded header content
-      // RFC2822 says to just remove the CRLF and not the whitespace following
-      // it, so we follow the RFC and include the leading whitespace ...
-      if (h) {
-        this.header[h][this.header[h].length - 1] += lines[i]
-        continue
-      }
-    }
-
-    const posColon = lines[i].indexOf(':')
-    if (
-      posColon === -1 ||
-      posColon === 0
-    ) {
-      return
-    }
-    m = RE_HDR.exec(lines[i])
-    h = m[1].toLowerCase()
-    this.header[h] = this.header[h] || []
-    this.header[h].push((m[2] || ''))
-    if (++this.npairs === this.maxHeaderPairs) { break }
-  }
-}
-
-module.exports = HeaderParser
-
-
-/***/ }),
-
-/***/ 38710:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-const inherits = (__nccwpck_require__(47261).inherits)
-const ReadableStream = (__nccwpck_require__(84492).Readable)
-
-function PartStream (opts) {
-  ReadableStream.call(this, opts)
-}
-inherits(PartStream, ReadableStream)
-
-PartStream.prototype._read = function (n) {}
-
-module.exports = PartStream
-
-
-/***/ }),
-
-/***/ 88534:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-/**
- * Copyright Brian White. All rights reserved.
- *
- * @see https://github.com/mscdex/streamsearch
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to
- * deal in the Software without restriction, including without limitation the
- * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
- * sell copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
- *
- * Based heavily on the Streaming Boyer-Moore-Horspool C++ implementation
- * by Hongli Lai at: https://github.com/FooBarWidget/boyer-moore-horspool
- */
-const EventEmitter = (__nccwpck_require__(15673).EventEmitter)
-const inherits = (__nccwpck_require__(47261).inherits)
-
-function SBMH (needle) {
-  if (typeof needle === 'string') {
-    needle = Buffer.from(needle)
-  }
-
-  if (!Buffer.isBuffer(needle)) {
-    throw new TypeError('The needle has to be a String or a Buffer.')
-  }
-
-  const needleLength = needle.length
-
-  if (needleLength === 0) {
-    throw new Error('The needle cannot be an empty String/Buffer.')
-  }
-
-  if (needleLength > 256) {
-    throw new Error('The needle cannot have a length bigger than 256.')
-  }
-
-  this.maxMatches = Infinity
-  this.matches = 0
-
-  this._occ = new Array(256)
-    .fill(needleLength) // Initialize occurrence table.
-  this._lookbehind_size = 0
-  this._needle = needle
-  this._bufpos = 0
-
-  this._lookbehind = Buffer.alloc(needleLength)
-
-  // Populate occurrence table with analysis of the needle,
-  // ignoring last letter.
-  for (var i = 0; i < needleLength - 1; ++i) { // eslint-disable-line no-var
-    this._occ[needle[i]] = needleLength - 1 - i
-  }
-}
-inherits(SBMH, EventEmitter)
-
-SBMH.prototype.reset = function () {
-  this._lookbehind_size = 0
-  this.matches = 0
-  this._bufpos = 0
-}
-
-SBMH.prototype.push = function (chunk, pos) {
-  if (!Buffer.isBuffer(chunk)) {
-    chunk = Buffer.from(chunk, 'binary')
-  }
-  const chlen = chunk.length
-  this._bufpos = pos || 0
-  let r
-  while (r !== chlen && this.matches < this.maxMatches) { r = this._sbmh_feed(chunk) }
-  return r
-}
-
-SBMH.prototype._sbmh_feed = function (data) {
-  const len = data.length
-  const needle = this._needle
-  const needleLength = needle.length
-  const lastNeedleChar = needle[needleLength - 1]
-
-  // Positive: points to a position in `data`
-  //           pos == 3 points to data[3]
-  // Negative: points to a position in the lookbehind buffer
-  //           pos == -2 points to lookbehind[lookbehind_size - 2]
-  let pos = -this._lookbehind_size
-  let ch
-
-  if (pos < 0) {
-    // Lookbehind buffer is not empty. Perform Boyer-Moore-Horspool
-    // search with character lookup code that considers both the
-    // lookbehind buffer and the current round's haystack data.
-    //
-    // Loop until
-    //   there is a match.
-    // or until
-    //   we've moved past the position that requires the
-    //   lookbehind buffer. In this case we switch to the
-    //   optimized loop.
-    // or until
-    //   the character to look at lies outside the haystack.
-    while (pos < 0 && pos <= len - needleLength) {
-      ch = this._sbmh_lookup_char(data, pos + needleLength - 1)
-
-      if (
-        ch === lastNeedleChar &&
-        this._sbmh_memcmp(data, pos, needleLength - 1)
-      ) {
-        this._lookbehind_size = 0
-        ++this.matches
-        this.emit('info', true)
-
-        return (this._bufpos = pos + needleLength)
-      }
-      pos += this._occ[ch]
-    }
-
-    // No match.
-
-    if (pos < 0) {
-      // There's too few data for Boyer-Moore-Horspool to run,
-      // so let's use a different algorithm to skip as much as
-      // we can.
-      // Forward pos until
-      //   the trailing part of lookbehind + data
-      //   looks like the beginning of the needle
-      // or until
-      //   pos == 0
-      while (pos < 0 && !this._sbmh_memcmp(data, pos, len - pos)) { ++pos }
-    }
-
-    if (pos >= 0) {
-      // Discard lookbehind buffer.
-      this.emit('info', false, this._lookbehind, 0, this._lookbehind_size)
-      this._lookbehind_size = 0
-    } else {
-      // Cut off part of the lookbehind buffer that has
-      // been processed and append the entire haystack
-      // into it.
-      const bytesToCutOff = this._lookbehind_size + pos
-      if (bytesToCutOff > 0) {
-        // The cut off data is guaranteed not to contain the needle.
-        this.emit('info', false, this._lookbehind, 0, bytesToCutOff)
-      }
-
-      this._lookbehind.copy(this._lookbehind, 0, bytesToCutOff,
-        this._lookbehind_size - bytesToCutOff)
-      this._lookbehind_size -= bytesToCutOff
-
-      data.copy(this._lookbehind, this._lookbehind_size)
-      this._lookbehind_size += len
-
-      this._bufpos = len
-      return len
-    }
-  }
-
-  pos += (pos >= 0) * this._bufpos
-
-  // Lookbehind buffer is now empty. We only need to check if the
-  // needle is in the haystack.
-  if (data.indexOf(needle, pos) !== -1) {
-    pos = data.indexOf(needle, pos)
-    ++this.matches
-    if (pos > 0) { this.emit('info', true, data, this._bufpos, pos) } else { this.emit('info', true) }
-
-    return (this._bufpos = pos + needleLength)
-  } else {
-    pos = len - needleLength
-  }
-
-  // There was no match. If there's trailing haystack data that we cannot
-  // match yet using the Boyer-Moore-Horspool algorithm (because the trailing
-  // data is less than the needle size) then match using a modified
-  // algorithm that starts matching from the beginning instead of the end.
-  // Whatever trailing data is left after running this algorithm is added to
-  // the lookbehind buffer.
-  while (
-    pos < len &&
-    (
-      data[pos] !== needle[0] ||
-      (
-        (Buffer.compare(
-          data.subarray(pos, pos + len - pos),
-          needle.subarray(0, len - pos)
-        ) !== 0)
-      )
-    )
-  ) {
-    ++pos
-  }
-  if (pos < len) {
-    data.copy(this._lookbehind, 0, pos, pos + (len - pos))
-    this._lookbehind_size = len - pos
-  }
-
-  // Everything until pos is guaranteed not to contain needle data.
-  if (pos > 0) { this.emit('info', false, data, this._bufpos, pos < len ? pos : len) }
-
-  this._bufpos = len
-  return len
-}
-
-SBMH.prototype._sbmh_lookup_char = function (data, pos) {
-  return (pos < 0)
-    ? this._lookbehind[this._lookbehind_size + pos]
-    : data[pos]
-}
-
-SBMH.prototype._sbmh_memcmp = function (data, pos, len) {
-  for (var i = 0; i < len; ++i) { // eslint-disable-line no-var
-    if (this._sbmh_lookup_char(data, pos + i) !== this._needle[i]) { return false }
-  }
-  return true
-}
-
-module.exports = SBMH
-
-
-/***/ }),
-
-/***/ 33438:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-const WritableStream = (__nccwpck_require__(84492).Writable)
-const { inherits } = __nccwpck_require__(47261)
-const Dicer = __nccwpck_require__(2856)
-
-const MultipartParser = __nccwpck_require__(90415)
-const UrlencodedParser = __nccwpck_require__(16780)
-const parseParams = __nccwpck_require__(34426)
-
-function Busboy (opts) {
-  if (!(this instanceof Busboy)) { return new Busboy(opts) }
-
-  if (typeof opts !== 'object') {
-    throw new TypeError('Busboy expected an options-Object.')
-  }
-  if (typeof opts.headers !== 'object') {
-    throw new TypeError('Busboy expected an options-Object with headers-attribute.')
-  }
-  if (typeof opts.headers['content-type'] !== 'string') {
-    throw new TypeError('Missing Content-Type-header.')
-  }
-
-  const {
-    headers,
-    ...streamOptions
-  } = opts
-
-  this.opts = {
-    autoDestroy: false,
-    ...streamOptions
-  }
-  WritableStream.call(this, this.opts)
-
-  this._done = false
-  this._parser = this.getParserByHeaders(headers)
-  this._finished = false
-}
-inherits(Busboy, WritableStream)
-
-Busboy.prototype.emit = function (ev) {
-  if (ev === 'finish') {
-    if (!this._done) {
-      this._parser?.end()
-      return
-    } else if (this._finished) {
-      return
-    }
-    this._finished = true
-  }
-  WritableStream.prototype.emit.apply(this, arguments)
-}
-
-Busboy.prototype.getParserByHeaders = function (headers) {
-  const parsed = parseParams(headers['content-type'])
-
-  const cfg = {
-    defCharset: this.opts.defCharset,
-    fileHwm: this.opts.fileHwm,
-    headers,
-    highWaterMark: this.opts.highWaterMark,
-    isPartAFile: this.opts.isPartAFile,
-    limits: this.opts.limits,
-    parsedConType: parsed,
-    preservePath: this.opts.preservePath
-  }
-
-  if (MultipartParser.detect.test(parsed[0])) {
-    return new MultipartParser(this, cfg)
-  }
-  if (UrlencodedParser.detect.test(parsed[0])) {
-    return new UrlencodedParser(this, cfg)
-  }
-  throw new Error('Unsupported Content-Type.')
-}
-
-Busboy.prototype._write = function (chunk, encoding, cb) {
-  this._parser.write(chunk, cb)
-}
-
-module.exports = Busboy
-module.exports["default"] = Busboy
-module.exports.Busboy = Busboy
-
-module.exports.Dicer = Dicer
-
-
-/***/ }),
-
-/***/ 90415:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-// TODO:
-//  * support 1 nested multipart level
-//    (see second multipart example here:
-//     http://www.w3.org/TR/html401/interact/forms.html#didx-multipartform-data)
-//  * support limits.fieldNameSize
-//     -- this will require modifications to utils.parseParams
-
-const { Readable } = __nccwpck_require__(84492)
-const { inherits } = __nccwpck_require__(47261)
-
-const Dicer = __nccwpck_require__(2856)
-
-const parseParams = __nccwpck_require__(34426)
-const decodeText = __nccwpck_require__(99136)
-const basename = __nccwpck_require__(60496)
-const getLimit = __nccwpck_require__(49692)
-
-const RE_BOUNDARY = /^boundary$/i
-const RE_FIELD = /^form-data$/i
-const RE_CHARSET = /^charset$/i
-const RE_FILENAME = /^filename$/i
-const RE_NAME = /^name$/i
-
-Multipart.detect = /^multipart\/form-data/i
-function Multipart (boy, cfg) {
-  let i
-  let len
-  const self = this
-  let boundary
-  const limits = cfg.limits
-  const isPartAFile = cfg.isPartAFile || ((fieldName, contentType, fileName) => (contentType === 'application/octet-stream' || fileName !== undefined))
-  const parsedConType = cfg.parsedConType || []
-  const defCharset = cfg.defCharset || 'utf8'
-  const preservePath = cfg.preservePath
-  const fileOpts = { highWaterMark: cfg.fileHwm }
-
-  for (i = 0, len = parsedConType.length; i < len; ++i) {
-    if (Array.isArray(parsedConType[i]) &&
-      RE_BOUNDARY.test(parsedConType[i][0])) {
-      boundary = parsedConType[i][1]
-      break
-    }
-  }
-
-  function checkFinished () {
-    if (nends === 0 && finished && !boy._done) {
-      finished = false
-      self.end()
-    }
-  }
-
-  if (typeof boundary !== 'string') { throw new Error('Multipart: Boundary not found') }
-
-  const fieldSizeLimit = getLimit(limits, 'fieldSize', 1 * 1024 * 1024)
-  const fileSizeLimit = getLimit(limits, 'fileSize', Infinity)
-  const filesLimit = getLimit(limits, 'files', Infinity)
-  const fieldsLimit = getLimit(limits, 'fields', Infinity)
-  const partsLimit = getLimit(limits, 'parts', Infinity)
-  const headerPairsLimit = getLimit(limits, 'headerPairs', 2000)
-  const headerSizeLimit = getLimit(limits, 'headerSize', 80 * 1024)
-
-  let nfiles = 0
-  let nfields = 0
-  let nends = 0
-  let curFile
-  let curField
-  let finished = false
-
-  this._needDrain = false
-  this._pause = false
-  this._cb = undefined
-  this._nparts = 0
-  this._boy = boy
-
-  const parserCfg = {
-    boundary,
-    maxHeaderPairs: headerPairsLimit,
-    maxHeaderSize: headerSizeLimit,
-    partHwm: fileOpts.highWaterMark,
-    highWaterMark: cfg.highWaterMark
-  }
-
-  this.parser = new Dicer(parserCfg)
-  this.parser.on('drain', function () {
-    self._needDrain = false
-    if (self._cb && !self._pause) {
-      const cb = self._cb
-      self._cb = undefined
-      cb()
-    }
-  }).on('part', function onPart (part) {
-    if (++self._nparts > partsLimit) {
-      self.parser.removeListener('part', onPart)
-      self.parser.on('part', skipPart)
-      boy.hitPartsLimit = true
-      boy.emit('partsLimit')
-      return skipPart(part)
-    }
-
-    // hack because streams2 _always_ doesn't emit 'end' until nextTick, so let
-    // us emit 'end' early since we know the part has ended if we are already
-    // seeing the next part
-    if (curField) {
-      const field = curField
-      field.emit('end')
-      field.removeAllListeners('end')
-    }
-
-    part.on('header', function (header) {
-      let contype
-      let fieldname
-      let parsed
-      let charset
-      let encoding
-      let filename
-      let nsize = 0
-
-      if (header['content-type']) {
-        parsed = parseParams(header['content-type'][0])
-        if (parsed[0]) {
-          contype = parsed[0].toLowerCase()
-          for (i = 0, len = parsed.length; i < len; ++i) {
-            if (RE_CHARSET.test(parsed[i][0])) {
-              charset = parsed[i][1].toLowerCase()
-              break
-            }
-          }
-        }
-      }
-
-      if (contype === undefined) { contype = 'text/plain' }
-      if (charset === undefined) { charset = defCharset }
-
-      if (header['content-disposition']) {
-        parsed = parseParams(header['content-disposition'][0])
-        if (!RE_FIELD.test(parsed[0])) { return skipPart(part) }
-        for (i = 0, len = parsed.length; i < len; ++i) {
-          if (RE_NAME.test(parsed[i][0])) {
-            fieldname = parsed[i][1]
-          } else if (RE_FILENAME.test(parsed[i][0])) {
-            filename = parsed[i][1]
-            if (!preservePath) { filename = basename(filename) }
-          }
-        }
-      } else { return skipPart(part) }
-
-      if (header['content-transfer-encoding']) { encoding = header['content-transfer-encoding'][0].toLowerCase() } else { encoding = '7bit' }
-
-      let onData,
-        onEnd
-
-      if (isPartAFile(fieldname, contype, filename)) {
-        // file/binary field
-        if (nfiles === filesLimit) {
-          if (!boy.hitFilesLimit) {
-            boy.hitFilesLimit = true
-            boy.emit('filesLimit')
-          }
-          return skipPart(part)
-        }
-
-        ++nfiles
-
-        if (!boy._events.file) {
-          self.parser._ignore()
-          return
-        }
-
-        ++nends
-        const file = new FileStream(fileOpts)
-        curFile = file
-        file.on('end', function () {
-          --nends
-          self._pause = false
-          checkFinished()
-          if (self._cb && !self._needDrain) {
-            const cb = self._cb
-            self._cb = undefined
-            cb()
-          }
-        })
-        file._read = function (n) {
-          if (!self._pause) { return }
-          self._pause = false
-          if (self._cb && !self._needDrain) {
-            const cb = self._cb
-            self._cb = undefined
-            cb()
-          }
-        }
-        boy.emit('file', fieldname, file, filename, encoding, contype)
-
-        onData = function (data) {
-          if ((nsize += data.length) > fileSizeLimit) {
-            const extralen = fileSizeLimit - nsize + data.length
-            if (extralen > 0) { file.push(data.slice(0, extralen)) }
-            file.truncated = true
-            file.bytesRead = fileSizeLimit
-            part.removeAllListeners('data')
-            file.emit('limit')
-            return
-          } else if (!file.push(data)) { self._pause = true }
-
-          file.bytesRead = nsize
-        }
-
-        onEnd = function () {
-          curFile = undefined
-          file.push(null)
-        }
-      } else {
-        // non-file field
-        if (nfields === fieldsLimit) {
-          if (!boy.hitFieldsLimit) {
-            boy.hitFieldsLimit = true
-            boy.emit('fieldsLimit')
-          }
-          return skipPart(part)
-        }
-
-        ++nfields
-        ++nends
-        let buffer = ''
-        let truncated = false
-        curField = part
-
-        onData = function (data) {
-          if ((nsize += data.length) > fieldSizeLimit) {
-            const extralen = (fieldSizeLimit - (nsize - data.length))
-            buffer += data.toString('binary', 0, extralen)
-            truncated = true
-            part.removeAllListeners('data')
-          } else { buffer += data.toString('binary') }
-        }
-
-        onEnd = function () {
-          curField = undefined
-          if (buffer.length) { buffer = decodeText(buffer, 'binary', charset) }
-          boy.emit('field', fieldname, buffer, false, truncated, encoding, contype)
-          --nends
-          checkFinished()
-        }
-      }
-
-      /* As of node@2efe4ab761666 (v0.10.29+/v0.11.14+), busboy had become
-         broken. Streams2/streams3 is a huge black box of confusion, but
-         somehow overriding the sync state seems to fix things again (and still
-         seems to work for previous node versions).
-      */
-      part._readableState.sync = false
-
-      part.on('data', onData)
-      part.on('end', onEnd)
-    }).on('error', function (err) {
-      if (curFile) { curFile.emit('error', err) }
-    })
-  }).on('error', function (err) {
-    boy.emit('error', err)
-  }).on('finish', function () {
-    finished = true
-    checkFinished()
-  })
-}
-
-Multipart.prototype.write = function (chunk, cb) {
-  const r = this.parser.write(chunk)
-  if (r && !this._pause) {
-    cb()
-  } else {
-    this._needDrain = !r
-    this._cb = cb
-  }
-}
-
-Multipart.prototype.end = function () {
-  const self = this
-
-  if (self.parser.writable) {
-    self.parser.end()
-  } else if (!self._boy._done) {
-    process.nextTick(function () {
-      self._boy._done = true
-      self._boy.emit('finish')
-    })
-  }
-}
-
-function skipPart (part) {
-  part.resume()
-}
-
-function FileStream (opts) {
-  Readable.call(this, opts)
-
-  this.bytesRead = 0
-
-  this.truncated = false
-}
-
-inherits(FileStream, Readable)
-
-FileStream.prototype._read = function (n) {}
-
-module.exports = Multipart
-
-
-/***/ }),
-
-/***/ 16780:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-const Decoder = __nccwpck_require__(89730)
-const decodeText = __nccwpck_require__(99136)
-const getLimit = __nccwpck_require__(49692)
-
-const RE_CHARSET = /^charset$/i
-
-UrlEncoded.detect = /^application\/x-www-form-urlencoded/i
-function UrlEncoded (boy, cfg) {
-  const limits = cfg.limits
-  const parsedConType = cfg.parsedConType
-  this.boy = boy
-
-  this.fieldSizeLimit = getLimit(limits, 'fieldSize', 1 * 1024 * 1024)
-  this.fieldNameSizeLimit = getLimit(limits, 'fieldNameSize', 100)
-  this.fieldsLimit = getLimit(limits, 'fields', Infinity)
-
-  let charset
-  for (var i = 0, len = parsedConType.length; i < len; ++i) { // eslint-disable-line no-var
-    if (Array.isArray(parsedConType[i]) &&
-        RE_CHARSET.test(parsedConType[i][0])) {
-      charset = parsedConType[i][1].toLowerCase()
-      break
-    }
-  }
-
-  if (charset === undefined) { charset = cfg.defCharset || 'utf8' }
-
-  this.decoder = new Decoder()
-  this.charset = charset
-  this._fields = 0
-  this._state = 'key'
-  this._checkingBytes = true
-  this._bytesKey = 0
-  this._bytesVal = 0
-  this._key = ''
-  this._val = ''
-  this._keyTrunc = false
-  this._valTrunc = false
-  this._hitLimit = false
-}
-
-UrlEncoded.prototype.write = function (data, cb) {
-  if (this._fields === this.fieldsLimit) {
-    if (!this.boy.hitFieldsLimit) {
-      this.boy.hitFieldsLimit = true
-      this.boy.emit('fieldsLimit')
-    }
-    return cb()
-  }
-
-  let idxeq; let idxamp; let i; let p = 0; const len = data.length
-
-  while (p < len) {
-    if (this._state === 'key') {
-      idxeq = idxamp = undefined
-      for (i = p; i < len; ++i) {
-        if (!this._checkingBytes) { ++p }
-        if (data[i] === 0x3D/* = */) {
-          idxeq = i
-          break
-        } else if (data[i] === 0x26/* & */) {
-          idxamp = i
-          break
-        }
-        if (this._checkingBytes && this._bytesKey === this.fieldNameSizeLimit) {
-          this._hitLimit = true
-          break
-        } else if (this._checkingBytes) { ++this._bytesKey }
-      }
-
-      if (idxeq !== undefined) {
-        // key with assignment
-        if (idxeq > p) { this._key += this.decoder.write(data.toString('binary', p, idxeq)) }
-        this._state = 'val'
-
-        this._hitLimit = false
-        this._checkingBytes = true
-        this._val = ''
-        this._bytesVal = 0
-        this._valTrunc = false
-        this.decoder.reset()
-
-        p = idxeq + 1
-      } else if (idxamp !== undefined) {
-        // key with no assignment
-        ++this._fields
-        let key; const keyTrunc = this._keyTrunc
-        if (idxamp > p) { key = (this._key += this.decoder.write(data.toString('binary', p, idxamp))) } else { key = this._key }
-
-        this._hitLimit = false
-        this._checkingBytes = true
-        this._key = ''
-        this._bytesKey = 0
-        this._keyTrunc = false
-        this.decoder.reset()
-
-        if (key.length) {
-          this.boy.emit('field', decodeText(key, 'binary', this.charset),
-            '',
-            keyTrunc,
-            false)
-        }
-
-        p = idxamp + 1
-        if (this._fields === this.fieldsLimit) { return cb() }
-      } else if (this._hitLimit) {
-        // we may not have hit the actual limit if there are encoded bytes...
-        if (i > p) { this._key += this.decoder.write(data.toString('binary', p, i)) }
-        p = i
-        if ((this._bytesKey = this._key.length) === this.fieldNameSizeLimit) {
-          // yep, we actually did hit the limit
-          this._checkingBytes = false
-          this._keyTrunc = true
-        }
-      } else {
-        if (p < len) { this._key += this.decoder.write(data.toString('binary', p)) }
-        p = len
-      }
-    } else {
-      idxamp = undefined
-      for (i = p; i < len; ++i) {
-        if (!this._checkingBytes) { ++p }
-        if (data[i] === 0x26/* & */) {
-          idxamp = i
-          break
-        }
-        if (this._checkingBytes && this._bytesVal === this.fieldSizeLimit) {
-          this._hitLimit = true
-          break
-        } else if (this._checkingBytes) { ++this._bytesVal }
-      }
-
-      if (idxamp !== undefined) {
-        ++this._fields
-        if (idxamp > p) { this._val += this.decoder.write(data.toString('binary', p, idxamp)) }
-        this.boy.emit('field', decodeText(this._key, 'binary', this.charset),
-          decodeText(this._val, 'binary', this.charset),
-          this._keyTrunc,
-          this._valTrunc)
-        this._state = 'key'
-
-        this._hitLimit = false
-        this._checkingBytes = true
-        this._key = ''
-        this._bytesKey = 0
-        this._keyTrunc = false
-        this.decoder.reset()
-
-        p = idxamp + 1
-        if (this._fields === this.fieldsLimit) { return cb() }
-      } else if (this._hitLimit) {
-        // we may not have hit the actual limit if there are encoded bytes...
-        if (i > p) { this._val += this.decoder.write(data.toString('binary', p, i)) }
-        p = i
-        if ((this._val === '' && this.fieldSizeLimit === 0) ||
-            (this._bytesVal = this._val.length) === this.fieldSizeLimit) {
-          // yep, we actually did hit the limit
-          this._checkingBytes = false
-          this._valTrunc = true
-        }
-      } else {
-        if (p < len) { this._val += this.decoder.write(data.toString('binary', p)) }
-        p = len
-      }
-    }
-  }
-  cb()
-}
-
-UrlEncoded.prototype.end = function () {
-  if (this.boy._done) { return }
-
-  if (this._state === 'key' && this._key.length > 0) {
-    this.boy.emit('field', decodeText(this._key, 'binary', this.charset),
-      '',
-      this._keyTrunc,
-      false)
-  } else if (this._state === 'val') {
-    this.boy.emit('field', decodeText(this._key, 'binary', this.charset),
-      decodeText(this._val, 'binary', this.charset),
-      this._keyTrunc,
-      this._valTrunc)
-  }
-  this.boy._done = true
-  this.boy.emit('finish')
-}
-
-module.exports = UrlEncoded
-
-
-/***/ }),
-
-/***/ 89730:
-/***/ ((module) => {
-
-"use strict";
-
-
-const RE_PLUS = /\+/g
-
-const HEX = [
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0,
-  0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-]
-
-function Decoder () {
-  this.buffer = undefined
-}
-Decoder.prototype.write = function (str) {
-  // Replace '+' with ' ' before decoding
-  str = str.replace(RE_PLUS, ' ')
-  let res = ''
-  let i = 0; let p = 0; const len = str.length
-  for (; i < len; ++i) {
-    if (this.buffer !== undefined) {
-      if (!HEX[str.charCodeAt(i)]) {
-        res += '%' + this.buffer
-        this.buffer = undefined
-        --i // retry character
-      } else {
-        this.buffer += str[i]
-        ++p
-        if (this.buffer.length === 2) {
-          res += String.fromCharCode(parseInt(this.buffer, 16))
-          this.buffer = undefined
-        }
-      }
-    } else if (str[i] === '%') {
-      if (i > p) {
-        res += str.substring(p, i)
-        p = i
-      }
-      this.buffer = ''
-      ++p
-    }
-  }
-  if (p < len && this.buffer === undefined) { res += str.substring(p) }
-  return res
-}
-Decoder.prototype.reset = function () {
-  this.buffer = undefined
-}
-
-module.exports = Decoder
-
-
-/***/ }),
-
-/***/ 60496:
-/***/ ((module) => {
-
-"use strict";
-
-
-module.exports = function basename (path) {
-  if (typeof path !== 'string') { return '' }
-  for (var i = path.length - 1; i >= 0; --i) { // eslint-disable-line no-var
-    switch (path.charCodeAt(i)) {
-      case 0x2F: // '/'
-      case 0x5C: // '\'
-        path = path.slice(i + 1)
-        return (path === '..' || path === '.' ? '' : path)
-    }
-  }
-  return (path === '..' || path === '.' ? '' : path)
-}
-
-
-/***/ }),
-
-/***/ 99136:
-/***/ ((module) => {
-
-"use strict";
-
-
-// Node has always utf-8
-const utf8Decoder = new TextDecoder('utf-8')
-const textDecoders = new Map([
-  ['utf-8', utf8Decoder],
-  ['utf8', utf8Decoder]
-])
-
-function decodeText (text, textEncoding, destEncoding) {
-  if (text) {
-    if (textDecoders.has(destEncoding)) {
-      try {
-        return textDecoders.get(destEncoding).decode(Buffer.from(text, textEncoding))
-      } catch (e) { }
-    } else {
-      try {
-        textDecoders.set(destEncoding, new TextDecoder(destEncoding))
-        return textDecoders.get(destEncoding).decode(Buffer.from(text, textEncoding))
-      } catch (e) { }
-    }
-  }
-  return text
-}
-
-module.exports = decodeText
-
-
-/***/ }),
-
-/***/ 49692:
-/***/ ((module) => {
-
-"use strict";
-
-
-module.exports = function getLimit (limits, name, defaultLimit) {
-  if (
-    !limits ||
-    limits[name] === undefined ||
-    limits[name] === null
-  ) { return defaultLimit }
-
-  if (
-    typeof limits[name] !== 'number' ||
-    isNaN(limits[name])
-  ) { throw new TypeError('Limit ' + name + ' is not a valid number') }
-
-  return limits[name]
-}
-
-
-/***/ }),
-
-/***/ 34426:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-const decodeText = __nccwpck_require__(99136)
-
-const RE_ENCODED = /%([a-fA-F0-9]{2})/g
-
-function encodedReplacer (match, byte) {
-  return String.fromCharCode(parseInt(byte, 16))
-}
-
-function parseParams (str) {
-  const res = []
-  let state = 'key'
-  let charset = ''
-  let inquote = false
-  let escaping = false
-  let p = 0
-  let tmp = ''
-
-  for (var i = 0, len = str.length; i < len; ++i) { // eslint-disable-line no-var
-    const char = str[i]
-    if (char === '\\' && inquote) {
-      if (escaping) { escaping = false } else {
-        escaping = true
-        continue
-      }
-    } else if (char === '"') {
-      if (!escaping) {
-        if (inquote) {
-          inquote = false
-          state = 'key'
-        } else { inquote = true }
-        continue
-      } else { escaping = false }
-    } else {
-      if (escaping && inquote) { tmp += '\\' }
-      escaping = false
-      if ((state === 'charset' || state === 'lang') && char === "'") {
-        if (state === 'charset') {
-          state = 'lang'
-          charset = tmp.substring(1)
-        } else { state = 'value' }
-        tmp = ''
-        continue
-      } else if (state === 'key' &&
-        (char === '*' || char === '=') &&
-        res.length) {
-        if (char === '*') { state = 'charset' } else { state = 'value' }
-        res[p] = [tmp, undefined]
-        tmp = ''
-        continue
-      } else if (!inquote && char === ';') {
-        state = 'key'
-        if (charset) {
-          if (tmp.length) {
-            tmp = decodeText(tmp.replace(RE_ENCODED, encodedReplacer),
-              'binary',
-              charset)
-          }
-          charset = ''
-        } else if (tmp.length) {
-          tmp = decodeText(tmp, 'binary', 'utf8')
-        }
-        if (res[p] === undefined) { res[p] = tmp } else { res[p][1] = tmp }
-        tmp = ''
-        ++p
-        continue
-      } else if (!inquote && (char === ' ' || char === '\t')) { continue }
-    }
-    tmp += char
-  }
-  if (charset && tmp.length) {
-    tmp = decodeText(tmp.replace(RE_ENCODED, encodedReplacer),
-      'binary',
-      charset)
-  } else if (tmp) {
-    tmp = decodeText(tmp, 'binary', 'utf8')
-  }
-
-  if (res[p] === undefined) {
-    if (tmp) { res[p] = tmp }
-  } else { res[p][1] = tmp }
-
-  return res
-}
-
-module.exports = parseParams
-
-
-/***/ }),
-
 /***/ 40334:
 /***/ ((module) => {
 
@@ -5165,9 +3755,14 @@ var import_graphql = __nccwpck_require__(88467);
 var import_auth_token = __nccwpck_require__(40334);
 
 // pkg/dist-src/version.js
-var VERSION = "5.0.1";
+var VERSION = "5.1.0";
 
 // pkg/dist-src/index.js
+var noop = () => {
+};
+var consoleWarn = console.warn.bind(console);
+var consoleError = console.error.bind(console);
+var userAgentTrail = `octokit-core.js/${VERSION} ${(0, import_universal_user_agent.getUserAgent)()}`;
 var Octokit = class {
   static {
     this.VERSION = VERSION;
@@ -5228,10 +3823,7 @@ var Octokit = class {
         format: ""
       }
     };
-    requestDefaults.headers["user-agent"] = [
-      options.userAgent,
-      `octokit-core.js/${VERSION} ${(0, import_universal_user_agent.getUserAgent)()}`
-    ].filter(Boolean).join(" ");
+    requestDefaults.headers["user-agent"] = options.userAgent ? `${options.userAgent} ${userAgentTrail}` : userAgentTrail;
     if (options.baseUrl) {
       requestDefaults.baseUrl = options.baseUrl;
     }
@@ -5245,12 +3837,10 @@ var Octokit = class {
     this.graphql = (0, import_graphql.withCustomRequest)(this.request).defaults(requestDefaults);
     this.log = Object.assign(
       {
-        debug: () => {
-        },
-        info: () => {
-        },
-        warn: console.warn.bind(console),
-        error: console.error.bind(console)
+        debug: noop,
+        info: noop,
+        warn: consoleWarn,
+        error: consoleError
       },
       options.log
     );
@@ -5287,9 +3877,9 @@ var Octokit = class {
       this.auth = auth;
     }
     const classConstructor = this.constructor;
-    classConstructor.plugins.forEach((plugin) => {
-      Object.assign(this, plugin(this, options));
-    });
+    for (let i = 0; i < classConstructor.plugins.length; ++i) {
+      Object.assign(this, classConstructor.plugins[i](this, options));
+    }
   }
 };
 // Annotate the CommonJS export names for ESM import in node:
@@ -5332,7 +3922,7 @@ module.exports = __toCommonJS(dist_src_exports);
 var import_universal_user_agent = __nccwpck_require__(45030);
 
 // pkg/dist-src/version.js
-var VERSION = "9.0.1";
+var VERSION = "9.0.4";
 
 // pkg/dist-src/defaults.js
 var userAgent = `octokit-endpoint.js/${VERSION} ${(0, import_universal_user_agent.getUserAgent)()}`;
@@ -5359,12 +3949,24 @@ function lowercaseKeys(object) {
   }, {});
 }
 
+// pkg/dist-src/util/is-plain-object.js
+function isPlainObject(value) {
+  if (typeof value !== "object" || value === null)
+    return false;
+  if (Object.prototype.toString.call(value) !== "[object Object]")
+    return false;
+  const proto = Object.getPrototypeOf(value);
+  if (proto === null)
+    return true;
+  const Ctor = Object.prototype.hasOwnProperty.call(proto, "constructor") && proto.constructor;
+  return typeof Ctor === "function" && Ctor instanceof Ctor && Function.prototype.call(Ctor) === Function.prototype.call(value);
+}
+
 // pkg/dist-src/util/merge-deep.js
-var import_is_plain_object = __nccwpck_require__(63287);
 function mergeDeep(defaults, options) {
   const result = Object.assign({}, defaults);
   Object.keys(options).forEach((key) => {
-    if ((0, import_is_plain_object.isPlainObject)(options[key])) {
+    if (isPlainObject(options[key])) {
       if (!(key in defaults))
         Object.assign(result, { [key]: options[key] });
       else
@@ -5439,10 +4041,13 @@ function extractUrlVariableNames(url) {
 
 // pkg/dist-src/util/omit.js
 function omit(object, keysToOmit) {
-  return Object.keys(object).filter((option) => !keysToOmit.includes(option)).reduce((obj, key) => {
-    obj[key] = object[key];
-    return obj;
-  }, {});
+  const result = { __proto__: null };
+  for (const key of Object.keys(object)) {
+    if (keysToOmit.indexOf(key) === -1) {
+      result[key] = object[key];
+    }
+  }
+  return result;
 }
 
 // pkg/dist-src/util/url-template.js
@@ -5540,7 +4145,7 @@ function parseUrl(template) {
 }
 function expand(template, context) {
   var operators = ["+", "#", ".", "/", ";", "?", "&"];
-  return template.replace(
+  template = template.replace(
     /\{([^\{\}]+)\}|([^\{\}]+)/g,
     function(_, expression, literal) {
       if (expression) {
@@ -5570,6 +4175,11 @@ function expand(template, context) {
       }
     }
   );
+  if (template === "/") {
+    return template;
+  } else {
+    return template.replace(/\/$/, "");
+  }
 }
 
 // pkg/dist-src/parse.js
@@ -5854,7 +4464,7 @@ __export(dist_src_exports, {
 module.exports = __toCommonJS(dist_src_exports);
 
 // pkg/dist-src/version.js
-var VERSION = "9.0.0";
+var VERSION = "9.1.5";
 
 // pkg/dist-src/normalize-paginated-list-response.js
 function normalizePaginatedListResponse(response) {
@@ -6023,9 +4633,11 @@ var paginatingEndpoints = [
   "GET /orgs/{org}/personal-access-tokens",
   "GET /orgs/{org}/personal-access-tokens/{pat_id}/repositories",
   "GET /orgs/{org}/projects",
+  "GET /orgs/{org}/properties/values",
   "GET /orgs/{org}/public_members",
   "GET /orgs/{org}/repos",
   "GET /orgs/{org}/rulesets",
+  "GET /orgs/{org}/rulesets/rule-suites",
   "GET /orgs/{org}/secret-scanning/alerts",
   "GET /orgs/{org}/security-advisories",
   "GET /orgs/{org}/teams",
@@ -6117,6 +4729,7 @@ var paginatingEndpoints = [
   "GET /repos/{owner}/{repo}/releases/{release_id}/reactions",
   "GET /repos/{owner}/{repo}/rules/branches/{branch}",
   "GET /repos/{owner}/{repo}/rulesets",
+  "GET /repos/{owner}/{repo}/rulesets/rule-suites",
   "GET /repos/{owner}/{repo}/secret-scanning/alerts",
   "GET /repos/{owner}/{repo}/secret-scanning/alerts/{alert_number}/locations",
   "GET /repos/{owner}/{repo}/security-advisories",
@@ -6248,7 +4861,7 @@ __export(dist_src_exports, {
 module.exports = __toCommonJS(dist_src_exports);
 
 // pkg/dist-src/version.js
-var VERSION = "10.0.1";
+var VERSION = "10.2.0";
 
 // pkg/dist-src/generated/endpoints.js
 var Endpoints = {
@@ -6352,6 +4965,9 @@ var Endpoints = {
     ],
     enableWorkflow: [
       "PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/enable"
+    ],
+    forceCancelWorkflowRun: [
+      "POST /repos/{owner}/{repo}/actions/runs/{run_id}/force-cancel"
     ],
     generateRunnerJitconfigForOrg: [
       "POST /orgs/{org}/actions/runners/generate-jitconfig"
@@ -6762,6 +5378,9 @@ var Endpoints = {
     addSelectedRepoToOrgSecret: [
       "PUT /orgs/{org}/codespaces/secrets/{secret_name}/repositories/{repository_id}"
     ],
+    checkPermissionsForDevcontainer: [
+      "GET /repos/{owner}/{repo}/codespaces/permissions_check"
+    ],
     codespaceMachinesForAuthenticatedUser: [
       "GET /user/codespaces/{codespace_name}/machines"
     ],
@@ -6879,7 +5498,7 @@ var Endpoints = {
       "DELETE /orgs/{org}/copilot/billing/selected_users"
     ],
     getCopilotOrganizationDetails: ["GET /orgs/{org}/copilot/billing"],
-    getCopilotSeatAssignmentDetailsForUser: [
+    getCopilotSeatDetailsForUser: [
       "GET /orgs/{org}/members/{username}/copilot"
     ],
     listCopilotSeats: ["GET /orgs/{org}/copilot/billing/seats"]
@@ -7092,7 +5711,13 @@ var Endpoints = {
     root: ["GET /"]
   },
   migrations: {
-    cancelImport: ["DELETE /repos/{owner}/{repo}/import"],
+    cancelImport: [
+      "DELETE /repos/{owner}/{repo}/import",
+      {},
+      {
+        deprecated: "octokit.rest.migrations.cancelImport() is deprecated, see https://docs.github.com/rest/migrations/source-imports#cancel-an-import"
+      }
+    ],
     deleteArchiveForAuthenticatedUser: [
       "DELETE /user/migrations/{migration_id}/archive"
     ],
@@ -7105,9 +5730,27 @@ var Endpoints = {
     getArchiveForAuthenticatedUser: [
       "GET /user/migrations/{migration_id}/archive"
     ],
-    getCommitAuthors: ["GET /repos/{owner}/{repo}/import/authors"],
-    getImportStatus: ["GET /repos/{owner}/{repo}/import"],
-    getLargeFiles: ["GET /repos/{owner}/{repo}/import/large_files"],
+    getCommitAuthors: [
+      "GET /repos/{owner}/{repo}/import/authors",
+      {},
+      {
+        deprecated: "octokit.rest.migrations.getCommitAuthors() is deprecated, see https://docs.github.com/rest/migrations/source-imports#get-commit-authors"
+      }
+    ],
+    getImportStatus: [
+      "GET /repos/{owner}/{repo}/import",
+      {},
+      {
+        deprecated: "octokit.rest.migrations.getImportStatus() is deprecated, see https://docs.github.com/rest/migrations/source-imports#get-an-import-status"
+      }
+    ],
+    getLargeFiles: [
+      "GET /repos/{owner}/{repo}/import/large_files",
+      {},
+      {
+        deprecated: "octokit.rest.migrations.getLargeFiles() is deprecated, see https://docs.github.com/rest/migrations/source-imports#get-large-files"
+      }
+    ],
     getStatusForAuthenticatedUser: ["GET /user/migrations/{migration_id}"],
     getStatusForOrg: ["GET /orgs/{org}/migrations/{migration_id}"],
     listForAuthenticatedUser: ["GET /user/migrations"],
@@ -7121,18 +5764,42 @@ var Endpoints = {
       {},
       { renamed: ["migrations", "listReposForAuthenticatedUser"] }
     ],
-    mapCommitAuthor: ["PATCH /repos/{owner}/{repo}/import/authors/{author_id}"],
-    setLfsPreference: ["PATCH /repos/{owner}/{repo}/import/lfs"],
+    mapCommitAuthor: [
+      "PATCH /repos/{owner}/{repo}/import/authors/{author_id}",
+      {},
+      {
+        deprecated: "octokit.rest.migrations.mapCommitAuthor() is deprecated, see https://docs.github.com/rest/migrations/source-imports#map-a-commit-author"
+      }
+    ],
+    setLfsPreference: [
+      "PATCH /repos/{owner}/{repo}/import/lfs",
+      {},
+      {
+        deprecated: "octokit.rest.migrations.setLfsPreference() is deprecated, see https://docs.github.com/rest/migrations/source-imports#update-git-lfs-preference"
+      }
+    ],
     startForAuthenticatedUser: ["POST /user/migrations"],
     startForOrg: ["POST /orgs/{org}/migrations"],
-    startImport: ["PUT /repos/{owner}/{repo}/import"],
+    startImport: [
+      "PUT /repos/{owner}/{repo}/import",
+      {},
+      {
+        deprecated: "octokit.rest.migrations.startImport() is deprecated, see https://docs.github.com/rest/migrations/source-imports#start-an-import"
+      }
+    ],
     unlockRepoForAuthenticatedUser: [
       "DELETE /user/migrations/{migration_id}/repos/{repo_name}/lock"
     ],
     unlockRepoForOrg: [
       "DELETE /orgs/{org}/migrations/{migration_id}/repos/{repo_name}/lock"
     ],
-    updateImport: ["PATCH /repos/{owner}/{repo}/import"]
+    updateImport: [
+      "PATCH /repos/{owner}/{repo}/import",
+      {},
+      {
+        deprecated: "octokit.rest.migrations.updateImport() is deprecated, see https://docs.github.com/rest/migrations/source-imports#update-an-import"
+      }
+    ]
   },
   orgs: {
     addSecurityManagerTeam: [
@@ -7147,6 +5814,13 @@ var Endpoints = {
       "PUT /orgs/{org}/outside_collaborators/{username}"
     ],
     createInvitation: ["POST /orgs/{org}/invitations"],
+    createOrUpdateCustomProperties: ["PATCH /orgs/{org}/properties/schema"],
+    createOrUpdateCustomPropertiesValuesForRepos: [
+      "PATCH /orgs/{org}/properties/values"
+    ],
+    createOrUpdateCustomProperty: [
+      "PUT /orgs/{org}/properties/schema/{custom_property_name}"
+    ],
     createWebhook: ["POST /orgs/{org}/hooks"],
     delete: ["DELETE /orgs/{org}"],
     deleteWebhook: ["DELETE /orgs/{org}/hooks/{hook_id}"],
@@ -7154,6 +5828,10 @@ var Endpoints = {
       "POST /orgs/{org}/{security_product}/{enablement}"
     ],
     get: ["GET /orgs/{org}"],
+    getAllCustomProperties: ["GET /orgs/{org}/properties/schema"],
+    getCustomProperty: [
+      "GET /orgs/{org}/properties/schema/{custom_property_name}"
+    ],
     getMembershipForAuthenticatedUser: ["GET /user/memberships/orgs/{org}"],
     getMembershipForUser: ["GET /orgs/{org}/memberships/{username}"],
     getWebhook: ["GET /orgs/{org}/hooks/{hook_id}"],
@@ -7164,6 +5842,7 @@ var Endpoints = {
     list: ["GET /organizations"],
     listAppInstallations: ["GET /orgs/{org}/installations"],
     listBlockedUsers: ["GET /orgs/{org}/blocks"],
+    listCustomPropertiesValuesForRepos: ["GET /orgs/{org}/properties/values"],
     listFailedInvitations: ["GET /orgs/{org}/failed_invitations"],
     listForAuthenticatedUser: ["GET /user/orgs"],
     listForUser: ["GET /users/{username}/orgs"],
@@ -7187,6 +5866,9 @@ var Endpoints = {
     pingWebhook: ["POST /orgs/{org}/hooks/{hook_id}/pings"],
     redeliverWebhookDelivery: [
       "POST /orgs/{org}/hooks/{hook_id}/deliveries/{delivery_id}/attempts"
+    ],
+    removeCustomProperty: [
+      "DELETE /orgs/{org}/properties/schema/{custom_property_name}"
     ],
     removeMember: ["DELETE /orgs/{org}/members/{username}"],
     removeMembershipForUser: ["DELETE /orgs/{org}/memberships/{username}"],
@@ -7668,6 +6350,7 @@ var Endpoints = {
     getCustomDeploymentProtectionRule: [
       "GET /repos/{owner}/{repo}/environments/{environment_name}/deployment_protection_rules/{protection_rule_id}"
     ],
+    getCustomPropertiesValues: ["GET /repos/{owner}/{repo}/properties/values"],
     getDeployKey: ["GET /repos/{owner}/{repo}/keys/{key_id}"],
     getDeployment: ["GET /repos/{owner}/{repo}/deployments/{deployment_id}"],
     getDeploymentBranchPolicy: [
@@ -7681,6 +6364,8 @@ var Endpoints = {
     ],
     getLatestPagesBuild: ["GET /repos/{owner}/{repo}/pages/builds/latest"],
     getLatestRelease: ["GET /repos/{owner}/{repo}/releases/latest"],
+    getOrgRuleSuite: ["GET /orgs/{org}/rulesets/rule-suites/{rule_suite_id}"],
+    getOrgRuleSuites: ["GET /orgs/{org}/rulesets/rule-suites"],
     getOrgRuleset: ["GET /orgs/{org}/rulesets/{ruleset_id}"],
     getOrgRulesets: ["GET /orgs/{org}/rulesets"],
     getPages: ["GET /repos/{owner}/{repo}/pages"],
@@ -7696,6 +6381,10 @@ var Endpoints = {
     getRelease: ["GET /repos/{owner}/{repo}/releases/{release_id}"],
     getReleaseAsset: ["GET /repos/{owner}/{repo}/releases/assets/{asset_id}"],
     getReleaseByTag: ["GET /repos/{owner}/{repo}/releases/tags/{tag}"],
+    getRepoRuleSuite: [
+      "GET /repos/{owner}/{repo}/rulesets/rule-suites/{rule_suite_id}"
+    ],
+    getRepoRuleSuites: ["GET /repos/{owner}/{repo}/rulesets/rule-suites"],
     getRepoRuleset: ["GET /repos/{owner}/{repo}/rulesets/{ruleset_id}"],
     getRepoRulesets: ["GET /repos/{owner}/{repo}/rulesets"],
     getStatusChecksProtection: [
@@ -8382,10 +7071,22 @@ var import_endpoint = __nccwpck_require__(59440);
 var import_universal_user_agent = __nccwpck_require__(45030);
 
 // pkg/dist-src/version.js
-var VERSION = "8.1.4";
+var VERSION = "8.2.0";
+
+// pkg/dist-src/is-plain-object.js
+function isPlainObject(value) {
+  if (typeof value !== "object" || value === null)
+    return false;
+  if (Object.prototype.toString.call(value) !== "[object Object]")
+    return false;
+  const proto = Object.getPrototypeOf(value);
+  if (proto === null)
+    return true;
+  const Ctor = Object.prototype.hasOwnProperty.call(proto, "constructor") && proto.constructor;
+  return typeof Ctor === "function" && Ctor instanceof Ctor && Function.prototype.call(Ctor) === Function.prototype.call(value);
+}
 
 // pkg/dist-src/fetch-wrapper.js
-var import_is_plain_object = __nccwpck_require__(63287);
 var import_request_error = __nccwpck_require__(10537);
 
 // pkg/dist-src/get-buffer-response.js
@@ -8398,7 +7099,7 @@ function fetchWrapper(requestOptions) {
   var _a, _b, _c;
   const log = requestOptions.request && requestOptions.request.log ? requestOptions.request.log : console;
   const parseSuccessResponseBody = ((_a = requestOptions.request) == null ? void 0 : _a.parseSuccessResponseBody) !== false;
-  if ((0, import_is_plain_object.isPlainObject)(requestOptions.body) || Array.isArray(requestOptions.body)) {
+  if (isPlainObject(requestOptions.body) || Array.isArray(requestOptions.body)) {
     requestOptions.body = JSON.stringify(requestOptions.body);
   }
   let headers = {};
@@ -8504,7 +7205,7 @@ function fetchWrapper(requestOptions) {
 async function getResponseData(response) {
   const contentType = response.headers.get("content-type");
   if (/application\/json/.test(contentType)) {
-    return response.json();
+    return response.json().catch(() => response.text()).catch(() => "");
   }
   if (!contentType || /^text\/|charset=utf-8$/.test(contentType)) {
     return response.text();
@@ -8514,11 +7215,17 @@ async function getResponseData(response) {
 function toErrorMessage(data) {
   if (typeof data === "string")
     return data;
+  let suffix;
+  if ("documentation_url" in data) {
+    suffix = ` - ${data.documentation_url}`;
+  } else {
+    suffix = "";
+  }
   if ("message" in data) {
     if (Array.isArray(data.errors)) {
-      return `${data.message}: ${data.errors.map(JSON.stringify).join(", ")}`;
+      return `${data.message}: ${data.errors.map(JSON.stringify).join(", ")}${suffix}`;
     }
-    return data.message;
+    return `${data.message}${suffix}`;
   }
   return `Unknown error: ${JSON.stringify(data)}`;
 }
@@ -12640,6 +11347,8 @@ exports.validate = function (xmlData, options) {
             return getErrorObject('InvalidTag', "Closing tag '"+tagName+"' doesn't have proper closing.", getLineNumberForPosition(xmlData, i));
           } else if (attrStr.trim().length > 0) {
             return getErrorObject('InvalidTag', "Closing tag '"+tagName+"' can't have attributes or invalid starting.", getLineNumberForPosition(xmlData, tagStartPos));
+          } else if (tags.length === 0) {
+            return getErrorObject('InvalidTag', "Closing tag '"+tagName+"' has not been opened.", getLineNumberForPosition(xmlData, tagStartPos));
           } else {
             const otg = tags.pop();
             if (tagName !== otg.tagName) {
@@ -13083,6 +11792,7 @@ Builder.prototype.j2x = function(jObj, level) {
       //repeated nodes
       const arrLen = jObj[key].length;
       let listTagVal = "";
+      let listTagAttr = "";
       for (let j = 0; j < arrLen; j++) {
         const item = jObj[key][j];
         if (typeof item === 'undefined') {
@@ -13092,17 +11802,27 @@ Builder.prototype.j2x = function(jObj, level) {
           else val += this.indentate(level) + '<' + key + '/' + this.tagEndChar;
           // val += this.indentate(level) + '<' + key + '/' + this.tagEndChar;
         } else if (typeof item === 'object') {
-          if(this.options.oneListGroup ){
-            listTagVal += this.j2x(item, level + 1).val;
+          if(this.options.oneListGroup){
+            const result = this.j2x(item, level + 1);
+            listTagVal += result.val;
+            if (this.options.attributesGroupName && item.hasOwnProperty(this.options.attributesGroupName)) {
+              listTagAttr += result.attrStr
+            }
           }else{
             listTagVal += this.processTextOrObjNode(item, key, level)
           }
         } else {
-          listTagVal += this.buildTextValNode(item, key, '', level);
+          if (this.options.oneListGroup) {
+            let textValue = this.options.tagValueProcessor(key, item);
+            textValue = this.replaceEntitiesValue(textValue);
+            listTagVal += textValue;
+          } else {
+            listTagVal += this.buildTextValNode(item, key, '', level);
+          }
         }
       }
       if(this.options.oneListGroup){
-        listTagVal = this.buildObjectNode(listTagVal, key, '', level);
+        listTagVal = this.buildObjectNode(listTagVal, key, listTagAttr, level);
       }
       val += listTagVal;
     } else {
@@ -13607,9 +12327,9 @@ const xmlNode = __nccwpck_require__(7462);
 const readDocType = __nccwpck_require__(6072);
 const toNumber = __nccwpck_require__(14526);
 
-const regx =
-  '<((!\\[CDATA\\[([\\s\\S]*?)(]]>))|((NAME:)?(NAME))([^>]*)>|((\\/)(NAME)\\s*>))([^<]*)'
-  .replace(/NAME/g, util.nameRegexp);
+// const regx =
+//   '<((!\\[CDATA\\[([\\s\\S]*?)(]]>))|((NAME:)?(NAME))([^>]*)>|((\\/)(NAME)\\s*>))([^<]*)'
+//   .replace(/NAME/g, util.nameRegexp);
 
 //const tagsRegx = new RegExp("<(\\/?[\\w:\\-\._]+)([^>]*)>(\\s*"+cdataRegx+")*([^<]+)?","g");
 //const tagsRegx = new RegExp("<(\\/?)((\\w*:)?([\\w:\\-\._]+))([^>]*)>([^<]*)("+cdataRegx+"([^<]*))*([^<]+)?","g");
@@ -13641,6 +12361,8 @@ class OrderedObjParser{
       "copyright" : { regex: /&(copy|#169);/g, val: "©" },
       "reg" : { regex: /&(reg|#174);/g, val: "®" },
       "inr" : { regex: /&(inr|#8377);/g, val: "₹" },
+      "num_dec": { regex: /&#([0-9]{1,7});/g, val : (_, str) => String.fromCharCode(Number.parseInt(str, 10)) },
+      "num_hex": { regex: /&#x([0-9a-fA-F]{1,6});/g, val : (_, str) => String.fromCharCode(Number.parseInt(str, 16)) },
     };
     this.addExternalEntities = addExternalEntities;
     this.parseXml = parseXml;
@@ -13866,14 +12588,13 @@ const parseXml = function(xmlData) {
 
         textData = this.saveTextToParentTag(textData, currentNode, jPath);
 
+        let val = this.parseTextData(tagExp, currentNode.tagname, jPath, true, false, true, true);
+        if(val == undefined) val = "";
+
         //cdata should be set even if it is 0 length string
         if(this.options.cdataPropName){
-          // let val = this.parseTextData(tagExp, this.options.cdataPropName, jPath + "." + this.options.cdataPropName, true, false, true);
-          // if(!val) val = "";
           currentNode.add(this.options.cdataPropName, [ { [this.options.textNodeName] : tagExp } ]);
         }else{
-          let val = this.parseTextData(tagExp, currentNode.tagname, jPath, true, false, true);
-          if(val == undefined) val = "";
           currentNode.add(this.options.textNodeName, val);
         }
         
@@ -13911,10 +12632,18 @@ const parseXml = function(xmlData) {
           let tagContent = "";
           //self-closing tag
           if(tagExp.length > 0 && tagExp.lastIndexOf("/") === tagExp.length - 1){
+            if(tagName[tagName.length - 1] === "/"){ //remove trailing '/'
+              tagName = tagName.substr(0, tagName.length - 1);
+              jPath = jPath.substr(0, jPath.length - 1);
+              tagExp = tagName;
+            }else{
+              tagExp = tagExp.substr(0, tagExp.length - 1);
+            }
             i = result.closeIndex;
           }
           //unpaired tag
           else if(this.options.unpairedTags.indexOf(tagName) !== -1){
+            
             i = result.closeIndex;
           }
           //normal tag
@@ -14102,8 +12831,8 @@ function readTagExp(xmlData,i, removeNSPrefix, closingChar = ">"){
   let tagName = tagExp;
   let attrExpPresent = true;
   if(separatorIndex !== -1){//separate tag name and attributes expression
-    tagName = tagExp.substr(0, separatorIndex).replace(/\s\s*$/, '');
-    tagExp = tagExp.substr(separatorIndex + 1);
+    tagName = tagExp.substring(0, separatorIndex);
+    tagExp = tagExp.substring(separatorIndex + 1).trimStart();
   }
 
   const rawTagName = tagName;
@@ -16010,52 +14739,6 @@ module.exports = function isExtendable(val) {
 
 /***/ }),
 
-/***/ 63287:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-
-/*!
- * is-plain-object <https://github.com/jonschlinkert/is-plain-object>
- *
- * Copyright (c) 2014-2017, Jon Schlinkert.
- * Released under the MIT License.
- */
-
-function isObject(o) {
-  return Object.prototype.toString.call(o) === '[object Object]';
-}
-
-function isPlainObject(o) {
-  var ctor,prot;
-
-  if (isObject(o) === false) return false;
-
-  // If has modified constructor
-  ctor = o.constructor;
-  if (ctor === undefined) return true;
-
-  // If has modified prototype
-  prot = ctor.prototype;
-  if (isObject(prot) === false) return false;
-
-  // If constructor does not have an Object-specific method
-  if (prot.hasOwnProperty('isPrototypeOf') === false) {
-    return false;
-  }
-
-  // Most likely a plain Object
-  return true;
-}
-
-exports.isPlainObject = isPlainObject;
-
-
-/***/ }),
-
 /***/ 83973:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -17080,7 +15763,6 @@ function onceStrict (fn) {
 var F = function () {
   return false;
 };
-
 module.exports = F;
 
 /***/ }),
@@ -17106,7 +15788,6 @@ module.exports = F;
 var T = function () {
   return true;
 };
-
 module.exports = T;
 
 /***/ }),
@@ -17150,9 +15831,7 @@ module.exports = {
 /***/ 38100:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Adds two values.
  *
@@ -17170,14 +15849,9 @@ __nccwpck_require__(69483);
  *      R.add(2, 3);       //=>  5
  *      R.add(7)(10);      //=> 17
  */
-
-
-var add =
-/*#__PURE__*/
-_curry2(function add(a, b) {
+var add = /*#__PURE__*/_curry2(function add(a, b) {
   return Number(a) + Number(b);
 });
-
 module.exports = add;
 
 /***/ }),
@@ -17185,17 +15859,9 @@ module.exports = add;
 /***/ 68215:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _concat =
-/*#__PURE__*/
-__nccwpck_require__(68118);
-
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
+var _concat = /*#__PURE__*/__nccwpck_require__(68118);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
 /**
  * Creates a new list iteration function from an existing one by adding two new
  * parameters to its callback function: the current index, and the entire list.
@@ -17220,27 +15886,20 @@ __nccwpck_require__(61071);
  *      mapIndexed((val, idx) => idx + '-' + val, ['f', 'o', 'o', 'b', 'a', 'r']);
  *      //=> ['0-f', '1-o', '2-o', '3-b', '4-a', '5-r']
  */
-
-
-var addIndex =
-/*#__PURE__*/
-_curry1(function addIndex(fn) {
+var addIndex = /*#__PURE__*/_curry1(function addIndex(fn) {
   return curryN(fn.length, function () {
     var idx = 0;
     var origFn = arguments[0];
     var list = arguments[arguments.length - 1];
     var args = Array.prototype.slice.call(arguments, 0);
-
     args[0] = function () {
       var result = origFn.apply(this, _concat(arguments, [idx, list]));
       idx += 1;
       return result;
     };
-
     return fn.apply(this, args);
   });
 });
-
 module.exports = addIndex;
 
 /***/ }),
@@ -17248,17 +15907,9 @@ module.exports = addIndex;
 /***/ 65314:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _concat =
-/*#__PURE__*/
-__nccwpck_require__(68118);
-
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
+var _concat = /*#__PURE__*/__nccwpck_require__(68118);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
 /**
  * As with `addIndex`, `addIndexRight` creates a new list iteration function
  * from an existing one by adding two new parameters to its callback function:
@@ -17281,27 +15932,20 @@ __nccwpck_require__(61071);
  *      revmapIndexed((val, idx) => idx + '-' + val, ['f', 'o', 'o', 'b', 'a', 'r']);
  *      //=> [ '5-r', '4-a', '3-b', '2-o', '1-o', '0-f' ]
  */
-
-
-var addIndexRight =
-/*#__PURE__*/
-_curry1(function addIndex(fn) {
+var addIndexRight = /*#__PURE__*/_curry1(function addIndex(fn) {
   return curryN(fn.length, function () {
     var origFn = arguments[0];
     var list = arguments[arguments.length - 1];
     var idx = list.length - 1;
     var args = Array.prototype.slice.call(arguments, 0);
-
     args[0] = function () {
       var result = origFn.apply(this, _concat(arguments, [idx, list]));
       idx -= 1;
       return result;
     };
-
     return fn.apply(this, args);
   });
 });
-
 module.exports = addIndexRight;
 
 /***/ }),
@@ -17309,13 +15953,8 @@ module.exports = addIndexRight;
 /***/ 50743:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _concat =
-/*#__PURE__*/
-__nccwpck_require__(68118);
-
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _concat = /*#__PURE__*/__nccwpck_require__(68118);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * Applies a function to the value at the given index of an array, returning a
  * new copy of the array with the element at the given index replaced with the
@@ -17341,25 +15980,16 @@ __nccwpck_require__(37597);
  * @symb R.adjust(-1, f, [a, b]) = [a, f(b)]
  * @symb R.adjust(0, f, [a, b]) = [f(a), b]
  */
-
-
-var adjust =
-/*#__PURE__*/
-_curry3(function adjust(idx, fn, list) {
+var adjust = /*#__PURE__*/_curry3(function adjust(idx, fn, list) {
   var len = list.length;
-
   if (idx >= len || idx < -len) {
     return list;
   }
-
   var _idx = (len + idx) % len;
-
   var _list = _concat(list);
-
   _list[_idx] = fn(list[_idx]);
   return _list;
 });
-
 module.exports = adjust;
 
 /***/ }),
@@ -17367,17 +15997,9 @@ module.exports = adjust;
 /***/ 26097:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xall =
-/*#__PURE__*/
-__nccwpck_require__(65023);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xall = /*#__PURE__*/__nccwpck_require__(65023);
 /**
  * Returns `true` if all elements of the list match the predicate, `false` if
  * there are any that don't.
@@ -17402,26 +16024,16 @@ __nccwpck_require__(65023);
  *      R.all(equals3)([3, 3, 3, 3]); //=> true
  *      R.all(equals3)([3, 3, 1, 3]); //=> false
  */
-
-
-var all =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable(['all'], _xall, function all(fn, list) {
+var all = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable(['all'], _xall, function all(fn, list) {
   var idx = 0;
-
   while (idx < list.length) {
     if (!fn(list[idx])) {
       return false;
     }
-
     idx += 1;
   }
-
   return true;
 }));
-
 module.exports = all;
 
 /***/ }),
@@ -17429,25 +16041,11 @@ module.exports = all;
 /***/ 80440:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
-
-var max =
-/*#__PURE__*/
-__nccwpck_require__(99356);
-
-var pluck =
-/*#__PURE__*/
-__nccwpck_require__(97413);
-
-var reduce =
-/*#__PURE__*/
-__nccwpck_require__(31941);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
+var max = /*#__PURE__*/__nccwpck_require__(99356);
+var pluck = /*#__PURE__*/__nccwpck_require__(97413);
+var reduce = /*#__PURE__*/__nccwpck_require__(31941);
 /**
  * Takes a list of predicates and returns a predicate that returns true for a
  * given list of arguments if every one of the provided predicates is satisfied
@@ -17473,27 +16071,19 @@ __nccwpck_require__(31941);
  *      isQueenOfSpades({rank: 'Q', suit: '♣︎'}); //=> false
  *      isQueenOfSpades({rank: 'Q', suit: '♠︎'}); //=> true
  */
-
-
-var allPass =
-/*#__PURE__*/
-_curry1(function allPass(preds) {
+var allPass = /*#__PURE__*/_curry1(function allPass(preds) {
   return curryN(reduce(max, 0, pluck('length', preds)), function () {
     var idx = 0;
     var len = preds.length;
-
     while (idx < len) {
       if (!preds[idx].apply(this, arguments)) {
         return false;
       }
-
       idx += 1;
     }
-
     return true;
   });
 });
-
 module.exports = allPass;
 
 /***/ }),
@@ -17501,9 +16091,7 @@ module.exports = allPass;
 /***/ 37770:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Returns a function that always returns the given value. Note that for
  * non-primitives the value returned is a reference to the original value.
@@ -17523,16 +16111,11 @@ __nccwpck_require__(60713);
  *      const t = R.always('Tee');
  *      t(); //=> 'Tee'
  */
-
-
-var always =
-/*#__PURE__*/
-_curry1(function always(val) {
+var always = /*#__PURE__*/_curry1(function always(val) {
   return function () {
     return val;
   };
 });
-
 module.exports = always;
 
 /***/ }),
@@ -17540,9 +16123,7 @@ module.exports = always;
 /***/ 44208:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Returns the first argument if it is falsy, otherwise the second argument.
  * Acts as the boolean `and` statement if both inputs are `Boolean`s.
@@ -17563,14 +16144,9 @@ __nccwpck_require__(69483);
  *      R.and(false, true); //=> false
  *      R.and(false, false); //=> false
  */
-
-
-var and =
-/*#__PURE__*/
-_curry2(function and(a, b) {
+var and = /*#__PURE__*/_curry2(function and(a, b) {
   return a && b;
 });
-
 module.exports = and;
 
 /***/ }),
@@ -17578,13 +16154,8 @@ module.exports = and;
 /***/ 58935:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _assertPromise =
-/*#__PURE__*/
-__nccwpck_require__(94549);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _assertPromise = /*#__PURE__*/__nccwpck_require__(94549);
 /**
  * Returns the result of applying the onSuccess function to the value inside
  * a successfully resolved promise. This is useful for working with promises
@@ -17615,16 +16186,10 @@ __nccwpck_require__(94549);
  *
  *      getMemberName('bob@gmail.com').then(console.log);
  */
-
-
-var andThen =
-/*#__PURE__*/
-_curry2(function andThen(f, p) {
+var andThen = /*#__PURE__*/_curry2(function andThen(f, p) {
   _assertPromise('andThen', p);
-
   return p.then(f);
 });
-
 module.exports = andThen;
 
 /***/ }),
@@ -17632,17 +16197,9 @@ module.exports = andThen;
 /***/ 24648:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xany =
-/*#__PURE__*/
-__nccwpck_require__(35447);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xany = /*#__PURE__*/__nccwpck_require__(35447);
 /**
  * Returns `true` if at least one of the elements of the list match the predicate,
  * `false` otherwise.
@@ -17668,26 +16225,16 @@ __nccwpck_require__(35447);
  *      R.any(lessThan0)([1, 2]); //=> false
  *      R.any(lessThan2)([1, 2]); //=> true
  */
-
-
-var any =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable(['any'], _xany, function any(fn, list) {
+var any = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable(['any'], _xany, function any(fn, list) {
   var idx = 0;
-
   while (idx < list.length) {
     if (fn(list[idx])) {
       return true;
     }
-
     idx += 1;
   }
-
   return false;
 }));
-
 module.exports = any;
 
 /***/ }),
@@ -17695,25 +16242,11 @@ module.exports = any;
 /***/ 86877:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
-
-var max =
-/*#__PURE__*/
-__nccwpck_require__(99356);
-
-var pluck =
-/*#__PURE__*/
-__nccwpck_require__(97413);
-
-var reduce =
-/*#__PURE__*/
-__nccwpck_require__(31941);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
+var max = /*#__PURE__*/__nccwpck_require__(99356);
+var pluck = /*#__PURE__*/__nccwpck_require__(97413);
+var reduce = /*#__PURE__*/__nccwpck_require__(31941);
 /**
  * Takes a list of predicates and returns a predicate that returns true for a
  * given list of arguments if at least one of the provided predicates is
@@ -17740,27 +16273,19 @@ __nccwpck_require__(31941);
  *      isBlackCard({rank: 'Q', suit: '♠'}); //=> true
  *      isBlackCard({rank: 'Q', suit: '♦'}); //=> false
  */
-
-
-var anyPass =
-/*#__PURE__*/
-_curry1(function anyPass(preds) {
+var anyPass = /*#__PURE__*/_curry1(function anyPass(preds) {
   return curryN(reduce(max, 0, pluck('length', preds)), function () {
     var idx = 0;
     var len = preds.length;
-
     while (idx < len) {
       if (preds[idx].apply(this, arguments)) {
         return true;
       }
-
       idx += 1;
     }
-
     return false;
   });
 });
-
 module.exports = anyPass;
 
 /***/ }),
@@ -17768,21 +16293,10 @@ module.exports = anyPass;
 /***/ 32857:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _concat =
-/*#__PURE__*/
-__nccwpck_require__(68118);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _reduce =
-/*#__PURE__*/
-__nccwpck_require__(92872);
-
-var map =
-/*#__PURE__*/
-__nccwpck_require__(28820);
+var _concat = /*#__PURE__*/__nccwpck_require__(68118);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _reduce = /*#__PURE__*/__nccwpck_require__(92872);
+var map = /*#__PURE__*/__nccwpck_require__(28820);
 /**
  * ap applies a list of functions to a list of values.
  *
@@ -17809,18 +16323,13 @@ __nccwpck_require__(28820);
  *      R.ap(R.concat, R.toUpper)('Ramda') //=> 'RamdaRAMDA'
  * @symb R.ap([f, g], [a, b]) = [f(a), f(b), g(a), g(b)]
  */
-
-
-var ap =
-/*#__PURE__*/
-_curry2(function ap(applyF, applyX) {
+var ap = /*#__PURE__*/_curry2(function ap(applyF, applyX) {
   return typeof applyX['fantasy-land/ap'] === 'function' ? applyX['fantasy-land/ap'](applyF) : typeof applyF.ap === 'function' ? applyF.ap(applyX) : typeof applyF === 'function' ? function (x) {
     return applyF(x)(applyX(x));
   } : _reduce(function (acc, f) {
     return _concat(acc, map(f, applyX));
   }, [], applyF);
 });
-
 module.exports = ap;
 
 /***/ }),
@@ -17828,21 +16337,10 @@ module.exports = ap;
 /***/ 40063:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _aperture =
-/*#__PURE__*/
-__nccwpck_require__(67914);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xaperture =
-/*#__PURE__*/
-__nccwpck_require__(77156);
+var _aperture = /*#__PURE__*/__nccwpck_require__(67914);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xaperture = /*#__PURE__*/__nccwpck_require__(77156);
 /**
  * Returns a new list, composed of n-tuples of consecutive elements. If `n` is
  * greater than the length of the list, an empty list is returned.
@@ -17864,14 +16362,7 @@ __nccwpck_require__(77156);
  *      R.aperture(3, [1, 2, 3, 4, 5]); //=> [[1, 2, 3], [2, 3, 4], [3, 4, 5]]
  *      R.aperture(7, [1, 2, 3, 4, 5]); //=> []
  */
-
-
-var aperture =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable([], _xaperture, _aperture));
-
+var aperture = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable([], _xaperture, _aperture));
 module.exports = aperture;
 
 /***/ }),
@@ -17879,13 +16370,8 @@ module.exports = aperture;
 /***/ 95059:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _concat =
-/*#__PURE__*/
-__nccwpck_require__(68118);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _concat = /*#__PURE__*/__nccwpck_require__(68118);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Returns a new list containing the contents of the given list, followed by
  * the given element.
@@ -17906,14 +16392,9 @@ __nccwpck_require__(69483);
  *      R.append('tests', []); //=> ['tests']
  *      R.append(['tests'], ['write', 'more']); //=> ['write', 'more', ['tests']]
  */
-
-
-var append =
-/*#__PURE__*/
-_curry2(function append(el, list) {
+var append = /*#__PURE__*/_curry2(function append(el, list) {
   return _concat(list, [el]);
 });
-
 module.exports = append;
 
 /***/ }),
@@ -17921,9 +16402,7 @@ module.exports = append;
 /***/ 95062:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Applies function `fn` to the argument list `args`. This is useful for
  * creating a fixed-arity function from a variadic function. `fn` should be a
@@ -17944,14 +16423,9 @@ __nccwpck_require__(69483);
  *      R.apply(Math.max, nums); //=> 42
  * @symb R.apply(f, [a, b, c]) = f(a, b, c)
  */
-
-
-var apply =
-/*#__PURE__*/
-_curry2(function apply(fn, args) {
+var apply = /*#__PURE__*/_curry2(function apply(fn, args) {
   return fn.apply(this, args);
 });
-
 module.exports = apply;
 
 /***/ }),
@@ -17959,50 +16433,23 @@ module.exports = apply;
 /***/ 3231:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var _isArray =
-/*#__PURE__*/
-__nccwpck_require__(56999);
-
-var apply =
-/*#__PURE__*/
-__nccwpck_require__(95062);
-
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
-
-var max =
-/*#__PURE__*/
-__nccwpck_require__(99356);
-
-var pluck =
-/*#__PURE__*/
-__nccwpck_require__(97413);
-
-var reduce =
-/*#__PURE__*/
-__nccwpck_require__(31941);
-
-var keys =
-/*#__PURE__*/
-__nccwpck_require__(96755);
-
-var values =
-/*#__PURE__*/
-__nccwpck_require__(6410); // Use custom mapValues function to avoid issues with specs that include a "map" key and R.map
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _isArray = /*#__PURE__*/__nccwpck_require__(56999);
+var apply = /*#__PURE__*/__nccwpck_require__(95062);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
+var max = /*#__PURE__*/__nccwpck_require__(99356);
+var pluck = /*#__PURE__*/__nccwpck_require__(97413);
+var reduce = /*#__PURE__*/__nccwpck_require__(31941);
+var keys = /*#__PURE__*/__nccwpck_require__(96755);
+var values = /*#__PURE__*/__nccwpck_require__(6410); // Use custom mapValues function to avoid issues with specs that include a "map" key and R.map
 // delegating calls to .map
-
-
 function mapValues(fn, obj) {
   return _isArray(obj) ? obj.map(fn) : keys(obj).reduce(function (acc, key) {
     acc[key] = fn(obj[key]);
     return acc;
   }, {});
 }
+
 /**
  * Given a spec object recursively mapping properties to functions, creates a
  * function producing an object of the same structure, by mapping each property
@@ -18028,11 +16475,7 @@ function mapValues(fn, obj) {
  *      getMetrics(2, 4); // => { sum: 6, nested: { mul: 8 } }
  * @symb R.applySpec({ x: f, y: { z: g } })(a, b) = { x: f(a, b), y: { z: g(a, b) } }
  */
-
-
-var applySpec =
-/*#__PURE__*/
-_curry1(function applySpec(spec) {
+var applySpec = /*#__PURE__*/_curry1(function applySpec(spec) {
   spec = mapValues(function (v) {
     return typeof v == 'function' ? v : applySpec(v);
   }, spec);
@@ -18043,7 +16486,6 @@ _curry1(function applySpec(spec) {
     }, spec);
   });
 });
-
 module.exports = applySpec;
 
 /***/ }),
@@ -18051,9 +16493,7 @@ module.exports = applySpec;
 /***/ 23395:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Takes a value and applies a function to it.
  *
@@ -18073,14 +16513,9 @@ __nccwpck_require__(69483);
  *      t42(R.identity); //=> 42
  *      t42(R.add(1)); //=> 43
  */
-
-
-var applyTo =
-/*#__PURE__*/
-_curry2(function applyTo(x, f) {
+var applyTo = /*#__PURE__*/_curry2(function applyTo(x, f) {
   return f(x);
 });
-
 module.exports = applyTo;
 
 /***/ }),
@@ -18088,9 +16523,7 @@ module.exports = applyTo;
 /***/ 78358:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * Makes an ascending comparator function out of a function that returns a value
  * that can be compared with `<` and `>`.
@@ -18104,7 +16537,7 @@ __nccwpck_require__(37597);
  * @param {*} a The first item to be compared.
  * @param {*} b The second item to be compared.
  * @return {Number} `-1` if fn(a) < fn(b), `1` if fn(b) < fn(a), otherwise `0`
- * @see R.descend
+ * @see R.descend, R.ascendNatural, R.descendNatural
  * @example
  *
  *      const byAge = R.ascend(R.prop('age'));
@@ -18116,30 +16549,63 @@ __nccwpck_require__(37597);
  *      const peopleByYoungestFirst = R.sort(byAge, people);
  *        //=> [{ name: 'Mikhail', age: 62 },{ name: 'Emma', age: 70 }, { name: 'Peter', age: 78 }]
  */
-
-
-var ascend =
-/*#__PURE__*/
-_curry3(function ascend(fn, a, b) {
+var ascend = /*#__PURE__*/_curry3(function ascend(fn, a, b) {
   var aa = fn(a);
   var bb = fn(b);
   return aa < bb ? -1 : aa > bb ? 1 : 0;
 });
-
 module.exports = ascend;
+
+/***/ }),
+
+/***/ 22857:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+var curry = /*#__PURE__*/__nccwpck_require__(40838);
+/**
+ * Makes an ascending comparator function out of a function that returns a value
+ * that can be compared with natural sorting using localeCompare.
+ *
+ * @func
+ * @memberOf R
+ * @since v0.30.1
+ * @category Function
+ * @sig Ord b => s -> (a -> b) -> a -> a -> Number
+ * @param {String|Array} locales A string with a BCP 47 language tag, or an array of such strings. Corresponds to the locales parameter of the Intl.Collator() constructor.
+ * @param {Function} fn A function of arity one that returns a value that can be compared
+ * @param {*} a The first item to be compared.
+ * @param {*} b The second item to be compared.
+ * @return {Number} `-1` if a occurs before b, `1` if a occurs after b, otherwise `0`
+ * @see R.ascend
+ * @example
+ *
+ *      const unsorted = ['3', '1', '10', 'Ørjan', 'Bob', 'Älva'];
+ *
+ *      R.sort(R.ascendNatural('en', R.identity), unsorted);
+ *      // => ['1', '3', '10', 'Älva', 'Bob', 'Ørjan']
+ *
+ *      R.sort(R.ascendNatural('sv', R.identity), unsorted);
+ *      // => ['1', '3', '10', 'Bob', 'Älva', 'Ørjan']
+ *
+ *     R.sort(R.ascend(R.identity), unsorted);
+ *      // => ['1', '10', '3', 'Bob', 'Älva', 'Ørjan']
+ */
+var ascendNatural = /*#__PURE__*/curry(function ascendNatural(locales, fn, a, b) {
+  const aa = fn(a);
+  const bb = fn(b);
+  return aa.localeCompare(bb, locales, {
+    numeric: true
+  });
+});
+module.exports = ascendNatural;
 
 /***/ }),
 
 /***/ 93295:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var assocPath =
-/*#__PURE__*/
-__nccwpck_require__(89947);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var assocPath = /*#__PURE__*/__nccwpck_require__(89947);
 /**
  * Makes a shallow clone of an object, setting or overriding the specified
  * property with the given value. Note that this copies and flattens prototype
@@ -18161,14 +16627,9 @@ __nccwpck_require__(89947);
  *
  *      R.assoc('c', 3, {a: 1, b: 2}); //=> {a: 1, b: 2, c: 3}
  */
-
-
-var assoc =
-/*#__PURE__*/
-_curry3(function assoc(prop, val, obj) {
+var assoc = /*#__PURE__*/_curry3(function assoc(prop, val, obj) {
   return assocPath([prop], val, obj);
 });
-
 module.exports = assoc;
 
 /***/ }),
@@ -18176,25 +16637,11 @@ module.exports = assoc;
 /***/ 89947:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var _has =
-/*#__PURE__*/
-__nccwpck_require__(41693);
-
-var _isInteger =
-/*#__PURE__*/
-__nccwpck_require__(87924);
-
-var _assoc =
-/*#__PURE__*/
-__nccwpck_require__(84702);
-
-var isNil =
-/*#__PURE__*/
-__nccwpck_require__(6895);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var _has = /*#__PURE__*/__nccwpck_require__(41693);
+var _isInteger = /*#__PURE__*/__nccwpck_require__(87924);
+var _assoc = /*#__PURE__*/__nccwpck_require__(84702);
+var isNil = /*#__PURE__*/__nccwpck_require__(6895);
 /**
  * Makes a shallow clone of an object, setting or overriding the nodes required
  * to create the given path, and placing the specific value at the tail end of
@@ -18219,25 +16666,17 @@ __nccwpck_require__(6895);
  *      // Any missing or non-object keys in path will be overridden
  *      R.assocPath(['a', 'b', 'c'], 42, {a: 5}); //=> {a: {b: {c: 42}}}
  */
-
-
-var assocPath =
-/*#__PURE__*/
-_curry3(function assocPath(path, val, obj) {
+var assocPath = /*#__PURE__*/_curry3(function assocPath(path, val, obj) {
   if (path.length === 0) {
     return val;
   }
-
   var idx = path[0];
-
   if (path.length > 1) {
     var nextObj = !isNil(obj) && _has(idx, obj) && typeof obj[idx] === 'object' ? obj[idx] : _isInteger(path[1]) ? [] : {};
     val = assocPath(Array.prototype.slice.call(path, 1), val, nextObj);
   }
-
   return _assoc(idx, val, obj);
 });
-
 module.exports = assocPath;
 
 /***/ }),
@@ -18245,13 +16684,8 @@ module.exports = assocPath;
 /***/ 56688:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var nAry =
-/*#__PURE__*/
-__nccwpck_require__(82843);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var nAry = /*#__PURE__*/__nccwpck_require__(82843);
 /**
  * Wraps a function of any arity (including nullary) in a function that accepts
  * exactly 2 parameters. Any extraneous parameters will not be passed to the
@@ -18280,14 +16714,9 @@ __nccwpck_require__(82843);
  *      takesTwoArgs(1, 2, 3); //=> [1, 2, undefined]
  * @symb R.binary(f)(a, b, c) = f(a, b)
  */
-
-
-var binary =
-/*#__PURE__*/
-_curry1(function binary(fn) {
+var binary = /*#__PURE__*/_curry1(function binary(fn) {
   return nAry(2, fn);
 });
-
 module.exports = binary;
 
 /***/ }),
@@ -18295,13 +16724,8 @@ module.exports = binary;
 /***/ 44458:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _arity =
-/*#__PURE__*/
-__nccwpck_require__(31414);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _arity = /*#__PURE__*/__nccwpck_require__(31414);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Creates a function that is bound to a context.
  * Note: `R.bind` does not provide the additional argument-binding capabilities of
@@ -18324,16 +16748,11 @@ __nccwpck_require__(69483);
  *      // logs {a: 2}
  * @symb R.bind(f, o)(a, b) = f.call(o, a, b)
  */
-
-
-var bind =
-/*#__PURE__*/
-_curry2(function bind(fn, thisObj) {
+var bind = /*#__PURE__*/_curry2(function bind(fn, thisObj) {
   return _arity(fn.length, function () {
     return fn.apply(thisObj, arguments);
   });
 });
-
 module.exports = bind;
 
 /***/ }),
@@ -18341,21 +16760,10 @@ module.exports = bind;
 /***/ 87192:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _isFunction =
-/*#__PURE__*/
-__nccwpck_require__(25997);
-
-var and =
-/*#__PURE__*/
-__nccwpck_require__(44208);
-
-var lift =
-/*#__PURE__*/
-__nccwpck_require__(53934);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _isFunction = /*#__PURE__*/__nccwpck_require__(25997);
+var and = /*#__PURE__*/__nccwpck_require__(44208);
+var lift = /*#__PURE__*/__nccwpck_require__(53934);
 /**
  * A function which calls the two provided functions and returns the `&&`
  * of the results.
@@ -18387,16 +16795,11 @@ __nccwpck_require__(53934);
  *      R.both(Maybe.Just(false), Maybe.Just(55)); // => Maybe.Just(false)
  *      R.both([false, false, 'a'], [11]); //=> [false, false, 11]
  */
-
-
-var both =
-/*#__PURE__*/
-_curry2(function both(f, g) {
+var both = /*#__PURE__*/_curry2(function both(f, g) {
   return _isFunction(f) ? function _both() {
     return f.apply(this, arguments) && g.apply(this, arguments);
   } : lift(and)(f, g);
 });
-
 module.exports = both;
 
 /***/ }),
@@ -18404,9 +16807,7 @@ module.exports = both;
 /***/ 96689:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Returns the result of calling its first argument with the remaining
  * arguments. This is occasionally useful as a converging function for
@@ -18444,14 +16845,9 @@ __nccwpck_require__(60713);
  *      format({indent: 2, value: 'foo\nbar\nbaz\n'}); //=> '  foo\n  bar\n  baz\n'
  * @symb R.call(f, a, b) = f(a, b)
  */
-
-
-var call =
-/*#__PURE__*/
-_curry1(function call(fn) {
+var call = /*#__PURE__*/_curry1(function call(fn) {
   return fn.apply(this, Array.prototype.slice.call(arguments, 1));
 });
-
 module.exports = call;
 
 /***/ }),
@@ -18459,25 +16855,11 @@ module.exports = call;
 /***/ 8210:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _makeFlat =
-/*#__PURE__*/
-__nccwpck_require__(17840);
-
-var _xchain =
-/*#__PURE__*/
-__nccwpck_require__(73620);
-
-var map =
-/*#__PURE__*/
-__nccwpck_require__(28820);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _makeFlat = /*#__PURE__*/__nccwpck_require__(17840);
+var _xchain = /*#__PURE__*/__nccwpck_require__(73620);
+var map = /*#__PURE__*/__nccwpck_require__(28820);
 /**
  * `chain` maps a function over a list and concatenates the results. `chain`
  * is also known as `flatMap` in some libraries.
@@ -18504,22 +16886,14 @@ __nccwpck_require__(28820);
  *
  *      R.chain(R.append, R.head)([1, 2, 3]); //=> [1, 2, 3, 1]
  */
-
-
-var chain =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable(['fantasy-land/chain', 'chain'], _xchain, function chain(fn, monad) {
+var chain = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable(['fantasy-land/chain', 'chain'], _xchain, function chain(fn, monad) {
   if (typeof monad === 'function') {
     return function (x) {
       return fn(monad(x))(x);
     };
   }
-
   return _makeFlat(false)(map(fn, monad));
 }));
-
 module.exports = chain;
 
 /***/ }),
@@ -18527,9 +16901,7 @@ module.exports = chain;
 /***/ 48927:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * Restricts a number to be within a range.
  *
@@ -18550,18 +16922,12 @@ __nccwpck_require__(37597);
  *      R.clamp(1, 10, 15) // => 10
  *      R.clamp(1, 10, 4)  // => 4
  */
-
-
-var clamp =
-/*#__PURE__*/
-_curry3(function clamp(min, max, value) {
+var clamp = /*#__PURE__*/_curry3(function clamp(min, max, value) {
   if (min > max) {
     throw new Error('min must not be greater than max in clamp(min, max, value)');
   }
-
   return value < min ? min : value > max ? max : value;
 });
-
 module.exports = clamp;
 
 /***/ }),
@@ -18569,13 +16935,8 @@ module.exports = clamp;
 /***/ 62675:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _clone =
-/*#__PURE__*/
-__nccwpck_require__(12726);
-
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var _clone = /*#__PURE__*/__nccwpck_require__(12726);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Creates a deep copy of the source that can be used in place of the source
  * object without retaining any references to it.
@@ -18603,14 +16964,9 @@ __nccwpck_require__(60713);
  *      objects === objectsClone; //=> false
  *      objects[0] === objectsClone[0]; //=> false
  */
-
-
-var clone =
-/*#__PURE__*/
-_curry1(function clone(value) {
+var clone = /*#__PURE__*/_curry1(function clone(value) {
   return value != null && typeof value.clone === 'function' ? value.clone() : _clone(value, true);
 });
-
 module.exports = clone;
 
 /***/ }),
@@ -18618,13 +16974,8 @@ module.exports = clone;
 /***/ 40441:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _reduce =
-/*#__PURE__*/
-__nccwpck_require__(92872);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _reduce = /*#__PURE__*/__nccwpck_require__(92872);
 /**
  * Splits a list into sub-lists, based on the result of calling a key-returning function on each element,
  * and grouping the results according to values returned.
@@ -18656,31 +17007,21 @@ __nccwpck_require__(92872);
  *      //     {type: 'lunch', item: '🍕'} ],
  *      //   [ {type: 'dinner', item: '🍝'} ] ]
  */
-
-
-var collectBy =
-/*#__PURE__*/
-_curry2(function collectBy(fn, list) {
+var collectBy = /*#__PURE__*/_curry2(function collectBy(fn, list) {
   var group = _reduce(function (o, x) {
     var tag = fn(x);
-
     if (o[tag] === undefined) {
       o[tag] = [];
     }
-
     o[tag].push(x);
     return o;
   }, {}, list);
-
   var newList = [];
-
   for (var tag in group) {
     newList.push(group[tag]);
   }
-
   return newList;
 });
-
 module.exports = collectBy;
 
 /***/ }),
@@ -18688,9 +17029,7 @@ module.exports = collectBy;
 /***/ 61876:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Makes a comparator function out of a function that reports whether the first
  * element is less than the second.
@@ -18714,16 +17053,11 @@ __nccwpck_require__(60713);
  *      const peopleByIncreasingAge = R.sort(byAge, people);
  *        //=> [{ name: 'Mikhail', age: 62 },{ name: 'Emma', age: 70 }, { name: 'Peter', age: 78 }]
  */
-
-
-var comparator =
-/*#__PURE__*/
-_curry1(function comparator(pred) {
+var comparator = /*#__PURE__*/_curry1(function comparator(pred) {
   return function (a, b) {
     return pred(a, b) ? -1 : pred(b, a) ? 1 : 0;
   };
 });
-
 module.exports = comparator;
 
 /***/ }),
@@ -18731,13 +17065,8 @@ module.exports = comparator;
 /***/ 22679:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var lift =
-/*#__PURE__*/
-__nccwpck_require__(53934);
-
-var not =
-/*#__PURE__*/
-__nccwpck_require__(83991);
+var lift = /*#__PURE__*/__nccwpck_require__(53934);
+var not = /*#__PURE__*/__nccwpck_require__(83991);
 /**
  * Takes a function `f` and returns a function `g` such that if called with the same arguments
  * when `f` returns a "truthy" value, `g` returns `false` and when `f` returns a "falsy" value `g` returns `true`.
@@ -18760,11 +17089,7 @@ __nccwpck_require__(83991);
  *      R.isNil(7); //=> false
  *      isNotNil(7); //=> true
  */
-
-
-var complement =
-/*#__PURE__*/
-lift(not);
+var complement = /*#__PURE__*/lift(not);
 module.exports = complement;
 
 /***/ }),
@@ -18772,13 +17097,8 @@ module.exports = complement;
 /***/ 73651:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var pipe =
-/*#__PURE__*/
-__nccwpck_require__(44216);
-
-var reverse =
-/*#__PURE__*/
-__nccwpck_require__(68495);
+var pipe = /*#__PURE__*/__nccwpck_require__(44216);
+var reverse = /*#__PURE__*/__nccwpck_require__(68495);
 /**
  * Performs right-to-left function composition. The last argument may have
  * any arity; the remaining arguments must be unary.
@@ -18804,16 +17124,12 @@ __nccwpck_require__(68495);
  * @symb R.compose(f, g, h)(a, b) = f(g(h(a, b)))
  * @symb R.compose(f, g, h)(a)(b) = f(g(h(a)))(b)
  */
-
-
 function compose() {
   if (arguments.length === 0) {
     throw new Error('compose requires at least one argument');
   }
-
   return pipe.apply(this, reverse(arguments));
 }
-
 module.exports = compose;
 
 /***/ }),
@@ -18821,17 +17137,9 @@ module.exports = compose;
 /***/ 58592:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var pipeWith =
-/*#__PURE__*/
-__nccwpck_require__(17709);
-
-var reverse =
-/*#__PURE__*/
-__nccwpck_require__(68495);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var pipeWith = /*#__PURE__*/__nccwpck_require__(17709);
+var reverse = /*#__PURE__*/__nccwpck_require__(68495);
 /**
  * Performs right-to-left function composition using transforming function. The last function may have
  * any arity; the remaining functions must be unary. Unlike `compose`, functions are passed in an array.
@@ -18857,14 +17165,9 @@ __nccwpck_require__(68495);
  *
  * @symb R.composeWith(f)([g, h, i])(...args) = f(g, f(h, i(...args)))
  */
-
-
-var composeWith =
-/*#__PURE__*/
-_curry2(function composeWith(xf, list) {
+var composeWith = /*#__PURE__*/_curry2(function composeWith(xf, list) {
   return pipeWith.apply(this, [xf, reverse(list)]);
 });
-
 module.exports = composeWith;
 
 /***/ }),
@@ -18872,25 +17175,11 @@ module.exports = composeWith;
 /***/ 57833:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _isArray =
-/*#__PURE__*/
-__nccwpck_require__(56999);
-
-var _isFunction =
-/*#__PURE__*/
-__nccwpck_require__(25997);
-
-var _isString =
-/*#__PURE__*/
-__nccwpck_require__(59076);
-
-var toString =
-/*#__PURE__*/
-__nccwpck_require__(76119);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _isArray = /*#__PURE__*/__nccwpck_require__(56999);
+var _isFunction = /*#__PURE__*/__nccwpck_require__(25997);
+var _isString = /*#__PURE__*/__nccwpck_require__(59076);
+var toString = /*#__PURE__*/__nccwpck_require__(76119);
 /**
  * Returns the result of concatenating the given lists or strings.
  *
@@ -18919,38 +17208,27 @@ __nccwpck_require__(76119);
  *      R.concat([4, 5, 6], [1, 2, 3]); //=> [4, 5, 6, 1, 2, 3]
  *      R.concat([], []); //=> []
  */
-
-
-var concat =
-/*#__PURE__*/
-_curry2(function concat(a, b) {
+var concat = /*#__PURE__*/_curry2(function concat(a, b) {
   if (_isArray(a)) {
     if (_isArray(b)) {
       return a.concat(b);
     }
-
     throw new TypeError(toString(b) + ' is not an array');
   }
-
   if (_isString(a)) {
     if (_isString(b)) {
       return a + b;
     }
-
     throw new TypeError(toString(b) + ' is not a string');
   }
-
   if (a != null && _isFunction(a['fantasy-land/concat'])) {
     return a['fantasy-land/concat'](b);
   }
-
   if (a != null && _isFunction(a.concat)) {
     return a.concat(b);
   }
-
   throw new TypeError(toString(a) + ' does not have a method named "concat" or "fantasy-land/concat"');
 });
-
 module.exports = concat;
 
 /***/ }),
@@ -18958,25 +17236,11 @@ module.exports = concat;
 /***/ 35335:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _arity =
-/*#__PURE__*/
-__nccwpck_require__(31414);
-
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var map =
-/*#__PURE__*/
-__nccwpck_require__(28820);
-
-var max =
-/*#__PURE__*/
-__nccwpck_require__(99356);
-
-var reduce =
-/*#__PURE__*/
-__nccwpck_require__(31941);
+var _arity = /*#__PURE__*/__nccwpck_require__(31414);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var map = /*#__PURE__*/__nccwpck_require__(28820);
+var max = /*#__PURE__*/__nccwpck_require__(99356);
+var reduce = /*#__PURE__*/__nccwpck_require__(31941);
 /**
  * Returns a function, `fn`, which encapsulates `if/else, if/else, ...` logic.
  * `R.cond` takes a list of [predicate, transformer] pairs. All of the arguments
@@ -19008,27 +17272,20 @@ __nccwpck_require__(31941);
  *      fn(50); //=> 'nothing special happens at 50°C'
  *      fn(100); //=> 'water boils at 100°C'
  */
-
-
-var cond =
-/*#__PURE__*/
-_curry1(function cond(pairs) {
+var cond = /*#__PURE__*/_curry1(function cond(pairs) {
   var arity = reduce(max, 0, map(function (pair) {
     return pair[0].length;
   }, pairs));
   return _arity(arity, function () {
     var idx = 0;
-
     while (idx < pairs.length) {
       if (pairs[idx][0].apply(this, arguments)) {
         return pairs[idx][1].apply(this, arguments);
       }
-
       idx += 1;
     }
   });
 });
-
 module.exports = cond;
 
 /***/ }),
@@ -19036,13 +17293,8 @@ module.exports = cond;
 /***/ 15611:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var constructN =
-/*#__PURE__*/
-__nccwpck_require__(62596);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var constructN = /*#__PURE__*/__nccwpck_require__(62596);
 /**
  * Wraps a constructor function inside a curried function that can be called
  * with the same arguments and returns the same type.
@@ -19075,14 +17327,9 @@ __nccwpck_require__(62596);
  *      const sightNewAnimal = R.compose(animalSighting, AnimalConstructor);
  *      R.map(sightNewAnimal, animalTypes); //=> ["It's a Lion!", "It's a Tiger!", "It's a Bear!"]
  */
-
-
-var construct =
-/*#__PURE__*/
-_curry1(function construct(Fn) {
+var construct = /*#__PURE__*/_curry1(function construct(Fn) {
   return constructN(Fn.length, Fn);
 });
-
 module.exports = construct;
 
 /***/ }),
@@ -19090,17 +17337,9 @@ module.exports = construct;
 /***/ 62596:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var curry =
-/*#__PURE__*/
-__nccwpck_require__(40838);
-
-var nAry =
-/*#__PURE__*/
-__nccwpck_require__(82843);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var curry = /*#__PURE__*/__nccwpck_require__(40838);
+var nAry = /*#__PURE__*/__nccwpck_require__(82843);
 /**
  * Wraps a constructor function inside a curried function that can be called
  * with the same arguments and returns the same type. The arity of the function
@@ -19136,56 +17375,40 @@ __nccwpck_require__(82843);
  *      // Add a dollop of Potato Chips
  *      // Add a dollop of Ketchup
  */
-
-
-var constructN =
-/*#__PURE__*/
-_curry2(function constructN(n, Fn) {
+var constructN = /*#__PURE__*/_curry2(function constructN(n, Fn) {
   if (n > 10) {
     throw new Error('Constructor with greater than ten arguments');
   }
-
   if (n === 0) {
     return function () {
       return new Fn();
     };
   }
-
   return curry(nAry(n, function ($0, $1, $2, $3, $4, $5, $6, $7, $8, $9) {
     switch (n) {
       case 1:
         return new Fn($0);
-
       case 2:
         return new Fn($0, $1);
-
       case 3:
         return new Fn($0, $1, $2);
-
       case 4:
         return new Fn($0, $1, $2, $3);
-
       case 5:
         return new Fn($0, $1, $2, $3, $4);
-
       case 6:
         return new Fn($0, $1, $2, $3, $4, $5);
-
       case 7:
         return new Fn($0, $1, $2, $3, $4, $5, $6);
-
       case 8:
         return new Fn($0, $1, $2, $3, $4, $5, $6, $7);
-
       case 9:
         return new Fn($0, $1, $2, $3, $4, $5, $6, $7, $8);
-
       case 10:
         return new Fn($0, $1, $2, $3, $4, $5, $6, $7, $8, $9);
     }
   }));
 });
-
 module.exports = constructN;
 
 /***/ }),
@@ -19193,29 +17416,12 @@ module.exports = constructN;
 /***/ 80810:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _map =
-/*#__PURE__*/
-__nccwpck_require__(38077);
-
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
-
-var max =
-/*#__PURE__*/
-__nccwpck_require__(99356);
-
-var pluck =
-/*#__PURE__*/
-__nccwpck_require__(97413);
-
-var reduce =
-/*#__PURE__*/
-__nccwpck_require__(31941);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _map = /*#__PURE__*/__nccwpck_require__(38077);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
+var max = /*#__PURE__*/__nccwpck_require__(99356);
+var pluck = /*#__PURE__*/__nccwpck_require__(97413);
+var reduce = /*#__PURE__*/__nccwpck_require__(31941);
 /**
  * Accepts a converging function and a list of branching functions and returns
  * a new function. The arity of the new function is the same as the arity of
@@ -19244,11 +17450,7 @@ __nccwpck_require__(31941);
  *
  * @symb R.converge(f, [g, h])(a, b) = f(g(a, b), h(a, b))
  */
-
-
-var converge =
-/*#__PURE__*/
-_curry2(function converge(after, fns) {
+var converge = /*#__PURE__*/_curry2(function converge(after, fns) {
   return curryN(reduce(max, 0, pluck('length', fns)), function () {
     var args = arguments;
     var context = this;
@@ -19257,7 +17459,6 @@ _curry2(function converge(after, fns) {
     }, fns));
   });
 });
-
 module.exports = converge;
 
 /***/ }),
@@ -19265,13 +17466,8 @@ module.exports = converge;
 /***/ 70862:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _reduce =
-/*#__PURE__*/
-__nccwpck_require__(92872);
-
-var curry =
-/*#__PURE__*/
-__nccwpck_require__(40838);
+var _reduce = /*#__PURE__*/__nccwpck_require__(92872);
+var curry = /*#__PURE__*/__nccwpck_require__(40838);
 /**
  * Returns the number of items in a given `list` matching the predicate `f`
  *
@@ -19289,11 +17485,7 @@ __nccwpck_require__(40838);
  *      R.count(even, [1, 2, 3, 4, 5]); // => 2
  *      R.map(R.count(even), [[1, 1, 1], [2, 3, 4, 5], [6]]); // => [0, 2, 1]
  */
-
-
-var count =
-/*#__PURE__*/
-curry(function (pred, list) {
+var count = /*#__PURE__*/curry(function (pred, list) {
   return _reduce(function (a, e) {
     return pred(e) ? a + 1 : a;
   }, 0, list);
@@ -19305,9 +17497,7 @@ module.exports = count;
 /***/ 41126:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var reduceBy =
-/*#__PURE__*/
-__nccwpck_require__(35645);
+var reduceBy = /*#__PURE__*/__nccwpck_require__(35645);
 /**
  * Counts the elements of a list according to how many match each value of a
  * key generated by the supplied function. Returns an object mapping the keys
@@ -19332,11 +17522,7 @@ __nccwpck_require__(35645);
  *      const letters = ['a', 'b', 'A', 'a', 'B', 'c'];
  *      R.countBy(R.toLower)(letters);   //=> {'a': 3, 'b': 2, 'c': 1}
  */
-
-
-var countBy =
-/*#__PURE__*/
-reduceBy(function (acc, elem) {
+var countBy = /*#__PURE__*/reduceBy(function (acc, elem) {
   return acc + 1;
 }, 0);
 module.exports = countBy;
@@ -19346,13 +17532,8 @@ module.exports = countBy;
 /***/ 40838:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
 /**
  * Returns a curried equivalent of the provided function. The curried function
  * has two unusual capabilities. First, its arguments needn't be provided one
@@ -19400,14 +17581,9 @@ __nccwpck_require__(61071);
  *      const h = R.curry((a, b, c = 2) => a + b + c);
  *      h(1)(2)(7); //=> Error! (`3` is not a function!)
  */
-
-
-var curry =
-/*#__PURE__*/
-_curry1(function curry(fn) {
+var curry = /*#__PURE__*/_curry1(function curry(fn) {
   return curryN(fn.length, fn);
 });
-
 module.exports = curry;
 
 /***/ }),
@@ -19415,21 +17591,10 @@ module.exports = curry;
 /***/ 61071:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _arity =
-/*#__PURE__*/
-__nccwpck_require__(31414);
-
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _curryN =
-/*#__PURE__*/
-__nccwpck_require__(14106);
+var _arity = /*#__PURE__*/__nccwpck_require__(31414);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _curryN = /*#__PURE__*/__nccwpck_require__(14106);
 /**
  * Returns a curried equivalent of the provided function, with the specified
  * arity. The curried function has two unusual capabilities. First, its
@@ -19472,18 +17637,12 @@ __nccwpck_require__(14106);
  *      const g = f(3);
  *      g(4); //=> 10
  */
-
-
-var curryN =
-/*#__PURE__*/
-_curry2(function curryN(length, fn) {
+var curryN = /*#__PURE__*/_curry2(function curryN(length, fn) {
   if (length === 1) {
     return _curry1(fn);
   }
-
   return _arity(length, _curryN(length, [], fn));
 });
-
 module.exports = curryN;
 
 /***/ }),
@@ -19491,9 +17650,7 @@ module.exports = curryN;
 /***/ 76536:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var add =
-/*#__PURE__*/
-__nccwpck_require__(38100);
+var add = /*#__PURE__*/__nccwpck_require__(38100);
 /**
  * Decrements its argument.
  *
@@ -19509,11 +17666,7 @@ __nccwpck_require__(38100);
  *
  *      R.dec(42); //=> 41
  */
-
-
-var dec =
-/*#__PURE__*/
-add(-1);
+var dec = /*#__PURE__*/add(-1);
 module.exports = dec;
 
 /***/ }),
@@ -19521,9 +17674,7 @@ module.exports = dec;
 /***/ 78445:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Returns the second argument if it is not `null`, `undefined` or `NaN`;
  * otherwise the first argument is returned.
@@ -19547,14 +17698,9 @@ __nccwpck_require__(69483);
  *      // parseInt('string') results in NaN
  *      defaultTo42(parseInt('string')); //=> 42
  */
-
-
-var defaultTo =
-/*#__PURE__*/
-_curry2(function defaultTo(d, v) {
+var defaultTo = /*#__PURE__*/_curry2(function defaultTo(d, v) {
   return v == null || v !== v ? d : v;
 });
-
 module.exports = defaultTo;
 
 /***/ }),
@@ -19562,9 +17708,7 @@ module.exports = defaultTo;
 /***/ 53144:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * Makes a descending comparator function out of a function that returns a value
  * that can be compared with `<` and `>`.
@@ -19578,7 +17722,7 @@ __nccwpck_require__(37597);
  * @param {*} a The first item to be compared.
  * @param {*} b The second item to be compared.
  * @return {Number} `-1` if fn(a) > fn(b), `1` if fn(b) > fn(a), otherwise `0`
- * @see R.ascend
+ * @see R.ascend, R.descendNatural, R.ascendNatural
  * @example
  *
  *      const byAge = R.descend(R.prop('age'));
@@ -19590,30 +17734,63 @@ __nccwpck_require__(37597);
  *      const peopleByOldestFirst = R.sort(byAge, people);
  *        //=> [{ name: 'Peter', age: 78 }, { name: 'Emma', age: 70 }, { name: 'Mikhail', age: 62 }]
  */
-
-
-var descend =
-/*#__PURE__*/
-_curry3(function descend(fn, a, b) {
+var descend = /*#__PURE__*/_curry3(function descend(fn, a, b) {
   var aa = fn(a);
   var bb = fn(b);
   return aa > bb ? -1 : aa < bb ? 1 : 0;
 });
-
 module.exports = descend;
+
+/***/ }),
+
+/***/ 52051:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+var curry = /*#__PURE__*/__nccwpck_require__(40838);
+/**
+ * Makes a descending comparator function out of a function that returns a value
+ * that can be compared with natural sorting using localeCompare.
+ *
+ * @func
+ * @memberOf R
+ * @since v0.30.1
+ * @category Function
+ * @sig Ord b => s -> (a -> b) -> a -> a -> Number
+ * @param {String|Array} locales A string with a BCP 47 language tag, or an array of such strings. Corresponds to the locales parameter of the Intl.Collator() constructor.
+ * @param {Function} fn A function of arity one that returns a value that can be compared
+ * @param {*} a The first item to be compared.
+ * @param {*} b The second item to be compared.
+ * @return {Number} `-1` if a occurs after b, `1` if a occurs before b, otherwise `0`
+ * @see R.descend
+ * @example
+ *
+ *      const unsorted = ['3', '1', '10', 'Ørjan', 'Bob', 'Älva'];
+ *
+ *      R.sort(R.descendNatural('en', R.identity), unsorted);
+ *      // => ['Ørjan', 'Bob', 'Älva', '10', '3', '1']
+ *
+ *      R.sort(R.descendNatural('sv', R.identity), unsorted);
+ *      // => ['Ørjan', 'Älva', 'Bob', '10', '3', '1']
+ *
+ *     R.sort(R.descend(R.identity), unsorted);
+ *      // => ['Ørjan', 'Älva', 'Bob', '3', '10', '1']
+ */
+var descendNatural = /*#__PURE__*/curry(function descendNatural(locales, fn, a, b) {
+  const aa = fn(a);
+  const bb = fn(b);
+  return bb.localeCompare(aa, locales, {
+    numeric: true
+  });
+});
+module.exports = descendNatural;
 
 /***/ }),
 
 /***/ 27013:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _Set =
-/*#__PURE__*/
-__nccwpck_require__(71781);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _Set = /*#__PURE__*/__nccwpck_require__(71781);
 /**
  * Finds the set (i.e. no duplicates) of all elements in the first list not
  * contained in the second list. Objects and Arrays are compared in terms of
@@ -19634,32 +17811,23 @@ __nccwpck_require__(71781);
  *      R.difference([7,6,5,4,3], [1,2,3,4]); //=> [7,6,5]
  *      R.difference([{a: 1}, {b: 2}], [{a: 1}, {c: 3}]) //=> [{b: 2}]
  */
-
-
-var difference =
-/*#__PURE__*/
-_curry2(function difference(first, second) {
+var difference = /*#__PURE__*/_curry2(function difference(first, second) {
   var out = [];
   var idx = 0;
   var firstLen = first.length;
   var secondLen = second.length;
   var toFilterOut = new _Set();
-
   for (var i = 0; i < secondLen; i += 1) {
     toFilterOut.add(second[i]);
   }
-
   while (idx < firstLen) {
     if (toFilterOut.add(first[idx])) {
       out[out.length] = first[idx];
     }
-
     idx += 1;
   }
-
   return out;
 });
-
 module.exports = difference;
 
 /***/ }),
@@ -19667,13 +17835,8 @@ module.exports = difference;
 /***/ 29323:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _includesWith =
-/*#__PURE__*/
-__nccwpck_require__(53968);
-
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _includesWith = /*#__PURE__*/__nccwpck_require__(53968);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * Finds the set (i.e. no duplicates) of all elements in the first list not
  * contained in the second list. Duplication is determined according to the
@@ -19699,26 +17862,18 @@ __nccwpck_require__(37597);
  *      R.differenceWith(R.equals, [1, 2, 3, 3, 3], []); //=> [1, 2, 3]
  *      R.differenceWith(R.equals, [1, 2, 3, 3, 3], [1]); //=> [2, 3]
  */
-
-
-var differenceWith =
-/*#__PURE__*/
-_curry3(function differenceWith(pred, first, second) {
+var differenceWith = /*#__PURE__*/_curry3(function differenceWith(pred, first, second) {
   var out = [];
   var idx = 0;
   var firstLen = first.length;
-
   while (idx < firstLen) {
     if (!_includesWith(pred, first[idx], second) && !_includesWith(pred, first[idx], out)) {
       out.push(first[idx]);
     }
-
     idx += 1;
   }
-
   return out;
 });
-
 module.exports = differenceWith;
 
 /***/ }),
@@ -19726,13 +17881,8 @@ module.exports = differenceWith;
 /***/ 5699:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var dissocPath =
-/*#__PURE__*/
-__nccwpck_require__(87900);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var dissocPath = /*#__PURE__*/__nccwpck_require__(87900);
 /**
  * Returns a new object that does not contain a `prop` property.
  *
@@ -19749,14 +17899,9 @@ __nccwpck_require__(87900);
  *
  *      R.dissoc('b', {a: 1, b: 2, c: 3}); //=> {a: 1, c: 3}
  */
-
-
-var dissoc =
-/*#__PURE__*/
-_curry2(function dissoc(prop, obj) {
+var dissoc = /*#__PURE__*/_curry2(function dissoc(prop, obj) {
   return dissocPath([prop], obj);
 });
-
 module.exports = dissoc;
 
 /***/ }),
@@ -19764,25 +17909,11 @@ module.exports = dissoc;
 /***/ 87900:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dissoc =
-/*#__PURE__*/
-__nccwpck_require__(95318);
-
-var _isInteger =
-/*#__PURE__*/
-__nccwpck_require__(87924);
-
-var _isArray =
-/*#__PURE__*/
-__nccwpck_require__(56999);
-
-var assoc =
-/*#__PURE__*/
-__nccwpck_require__(93295);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dissoc = /*#__PURE__*/__nccwpck_require__(95318);
+var _isInteger = /*#__PURE__*/__nccwpck_require__(87924);
+var _isArray = /*#__PURE__*/__nccwpck_require__(56999);
+var assoc = /*#__PURE__*/__nccwpck_require__(93295);
 /**
  * Makes a shallow clone of an object. Note that this copies and flattens
  * prototype properties onto the new object as well. All non-primitive
@@ -19793,21 +17924,17 @@ __nccwpck_require__(93295);
  * @param {Object|Array} obj The object to clone
  * @return {Object|Array} A new object equivalent to the original.
  */
-
-
 function _shallowCloneObject(prop, obj) {
   if (_isInteger(prop) && _isArray(obj)) {
     return [].concat(obj);
   }
-
   var result = {};
-
   for (var p in obj) {
     result[p] = obj[p];
   }
-
   return result;
 }
+
 /**
  * Makes a shallow clone of an object, omitting the property at the given path.
  * Note that this copies and flattens prototype properties onto the new object
@@ -19827,35 +17954,25 @@ function _shallowCloneObject(prop, obj) {
  *
  *      R.dissocPath(['a', 'b', 'c'], {a: {b: {c: 42}}}); //=> {a: {b: {}}}
  */
-
-
-var dissocPath =
-/*#__PURE__*/
-_curry2(function dissocPath(path, obj) {
+var dissocPath = /*#__PURE__*/_curry2(function dissocPath(path, obj) {
   if (obj == null) {
     return obj;
   }
-
   switch (path.length) {
     case 0:
       return obj;
-
     case 1:
       return _dissoc(path[0], obj);
-
     default:
       var head = path[0];
       var tail = Array.prototype.slice.call(path, 1);
-
       if (obj[head] == null) {
         return _shallowCloneObject(head, obj);
       } else {
         return assoc(head, dissocPath(tail, obj[head]), obj);
       }
-
   }
 });
-
 module.exports = dissocPath;
 
 /***/ }),
@@ -19863,9 +17980,7 @@ module.exports = dissocPath;
 /***/ 74144:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Divides two numbers. Equivalent to `a / b`.
  *
@@ -19888,14 +18003,9 @@ __nccwpck_require__(69483);
  *      const reciprocal = R.divide(1);
  *      reciprocal(4);   //=> 0.25
  */
-
-
-var divide =
-/*#__PURE__*/
-_curry2(function divide(a, b) {
+var divide = /*#__PURE__*/_curry2(function divide(a, b) {
   return a / b;
 });
-
 module.exports = divide;
 
 /***/ }),
@@ -19903,21 +18013,10 @@ module.exports = divide;
 /***/ 66769:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xdrop =
-/*#__PURE__*/
-__nccwpck_require__(79796);
-
-var slice =
-/*#__PURE__*/
-__nccwpck_require__(47108);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xdrop = /*#__PURE__*/__nccwpck_require__(79796);
+var slice = /*#__PURE__*/__nccwpck_require__(47108);
 /**
  * Returns all but the first `n` elements of the given list, string, or
  * transducer/transformer (or object with a `drop` method).
@@ -19942,16 +18041,9 @@ __nccwpck_require__(47108);
  *      R.drop(4, ['foo', 'bar', 'baz']); //=> []
  *      R.drop(3, 'ramda');               //=> 'da'
  */
-
-
-var drop =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable(['drop'], _xdrop, function drop(n, xs) {
+var drop = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable(['drop'], _xdrop, function drop(n, xs) {
   return slice(Math.max(0, n), Infinity, xs);
 }));
-
 module.exports = drop;
 
 /***/ }),
@@ -19959,21 +18051,10 @@ module.exports = drop;
 /***/ 90681:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _dropLast =
-/*#__PURE__*/
-__nccwpck_require__(81166);
-
-var _xdropLast =
-/*#__PURE__*/
-__nccwpck_require__(73750);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _dropLast = /*#__PURE__*/__nccwpck_require__(81166);
+var _xdropLast = /*#__PURE__*/__nccwpck_require__(73750);
 /**
  * Returns a list containing all but the last `n` elements of the given `list`.
  *
@@ -19997,14 +18078,7 @@ __nccwpck_require__(73750);
  *      R.dropLast(4, ['foo', 'bar', 'baz']); //=> []
  *      R.dropLast(3, 'ramda');               //=> 'ra'
  */
-
-
-var dropLast =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable([], _xdropLast, _dropLast));
-
+var dropLast = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable([], _xdropLast, _dropLast));
 module.exports = dropLast;
 
 /***/ }),
@@ -20012,21 +18086,10 @@ module.exports = dropLast;
 /***/ 99494:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _dropLastWhile =
-/*#__PURE__*/
-__nccwpck_require__(96204);
-
-var _xdropLastWhile =
-/*#__PURE__*/
-__nccwpck_require__(56957);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _dropLastWhile = /*#__PURE__*/__nccwpck_require__(96204);
+var _xdropLastWhile = /*#__PURE__*/__nccwpck_require__(56957);
 /**
  * Returns a new list excluding all the tailing elements of a given list which
  * satisfy the supplied predicate function. It passes each value from the right
@@ -20054,14 +18117,7 @@ __nccwpck_require__(56957);
  *
  *      R.dropLastWhile(x => x !== 'd' , 'Ramda'); //=> 'Ramd'
  */
-
-
-var dropLastWhile =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable([], _xdropLastWhile, _dropLastWhile));
-
+var dropLastWhile = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable([], _xdropLastWhile, _dropLastWhile));
 module.exports = dropLastWhile;
 
 /***/ }),
@@ -20069,25 +18125,11 @@ module.exports = dropLastWhile;
 /***/ 55300:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xdropRepeatsWith =
-/*#__PURE__*/
-__nccwpck_require__(81349);
-
-var dropRepeatsWith =
-/*#__PURE__*/
-__nccwpck_require__(86395);
-
-var equals =
-/*#__PURE__*/
-__nccwpck_require__(50548);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xdropRepeatsWith = /*#__PURE__*/__nccwpck_require__(81349);
+var dropRepeatsWith = /*#__PURE__*/__nccwpck_require__(86395);
+var equals = /*#__PURE__*/__nccwpck_require__(50548);
 /**
  * Returns a new list without any consecutively repeating elements.
  * [`R.equals`](#equals) is used to determine equality.
@@ -20106,18 +18148,9 @@ __nccwpck_require__(50548);
  *
  *     R.dropRepeats([1, 1, 1, 2, 3, 4, 4, 2, 2]); //=> [1, 2, 3, 4, 2]
  */
-
-
-var dropRepeats =
-/*#__PURE__*/
-_curry1(
-/*#__PURE__*/
-_dispatchable([], function () {
+var dropRepeats = /*#__PURE__*/_curry1( /*#__PURE__*/_dispatchable([], function () {
   return _xdropRepeatsWith(equals);
-},
-/*#__PURE__*/
-dropRepeatsWith(equals)));
-
+}, /*#__PURE__*/dropRepeatsWith(equals)));
 module.exports = dropRepeats;
 
 /***/ }),
@@ -20125,25 +18158,11 @@ module.exports = dropRepeats;
 /***/ 27399:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xdropRepeatsWith =
-/*#__PURE__*/
-__nccwpck_require__(81349);
-
-var dropRepeatsWith =
-/*#__PURE__*/
-__nccwpck_require__(86395);
-
-var eqBy =
-/*#__PURE__*/
-__nccwpck_require__(88878);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xdropRepeatsWith = /*#__PURE__*/__nccwpck_require__(81349);
+var dropRepeatsWith = /*#__PURE__*/__nccwpck_require__(86395);
+var eqBy = /*#__PURE__*/__nccwpck_require__(88878);
 /**
  * Returns a new list without any consecutively repeating elements,
  * based upon the value returned by applying the supplied function to
@@ -20164,16 +18183,11 @@ __nccwpck_require__(88878);
  *
  *     R.dropRepeatsBy(Math.abs, [1, -1, -1, 2, 3, -4, 4, 2, 2]); //=> [1, 2, 3, -4, 2]
  */
-
-
-var dropRepeatsBy =
-/*#__PURE__*/
-_curry2(function (fn, list) {
+var dropRepeatsBy = /*#__PURE__*/_curry2(function (fn, list) {
   return _dispatchable([], function () {
     return _xdropRepeatsWith(eqBy(fn));
   }, dropRepeatsWith(eqBy(fn)))(list);
 });
-
 module.exports = dropRepeatsBy;
 
 /***/ }),
@@ -20181,21 +18195,10 @@ module.exports = dropRepeatsBy;
 /***/ 86395:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xdropRepeatsWith =
-/*#__PURE__*/
-__nccwpck_require__(81349);
-
-var last =
-/*#__PURE__*/
-__nccwpck_require__(83855);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xdropRepeatsWith = /*#__PURE__*/__nccwpck_require__(81349);
+var last = /*#__PURE__*/__nccwpck_require__(83855);
 /**
  * Returns a new list without any consecutively repeating elements. Equality is
  * determined by applying the supplied predicate to each pair of consecutive elements. The
@@ -20217,32 +18220,21 @@ __nccwpck_require__(83855);
  *      const l = [1, -1, 1, 3, 4, -4, -4, -5, 5, 3, 3];
  *      R.dropRepeatsWith(R.eqBy(Math.abs), l); //=> [1, 3, 4, -5, 3]
  */
-
-
-var dropRepeatsWith =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable([], _xdropRepeatsWith, function dropRepeatsWith(pred, list) {
+var dropRepeatsWith = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable([], _xdropRepeatsWith, function dropRepeatsWith(pred, list) {
   var result = [];
   var idx = 1;
   var len = list.length;
-
   if (len !== 0) {
     result[0] = list[0];
-
     while (idx < len) {
       if (!pred(last(result), list[idx])) {
         result[result.length] = list[idx];
       }
-
       idx += 1;
     }
   }
-
   return result;
 }));
-
 module.exports = dropRepeatsWith;
 
 /***/ }),
@@ -20250,21 +18242,10 @@ module.exports = dropRepeatsWith;
 /***/ 25245:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xdropWhile =
-/*#__PURE__*/
-__nccwpck_require__(72591);
-
-var slice =
-/*#__PURE__*/
-__nccwpck_require__(47108);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xdropWhile = /*#__PURE__*/__nccwpck_require__(72591);
+var slice = /*#__PURE__*/__nccwpck_require__(47108);
 /**
  * Returns a new list excluding the leading elements of a given list which
  * satisfy the supplied predicate function. It passes each value to the supplied
@@ -20293,23 +18274,14 @@ __nccwpck_require__(47108);
  *
  *      R.dropWhile(x => x !== 'd' , 'Ramda'); //=> 'da'
  */
-
-
-var dropWhile =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable(['dropWhile'], _xdropWhile, function dropWhile(pred, xs) {
+var dropWhile = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable(['dropWhile'], _xdropWhile, function dropWhile(pred, xs) {
   var idx = 0;
   var len = xs.length;
-
   while (idx < len && pred(xs[idx])) {
     idx += 1;
   }
-
   return slice(idx, Infinity, xs);
 }));
-
 module.exports = dropWhile;
 
 /***/ }),
@@ -20317,21 +18289,10 @@ module.exports = dropWhile;
 /***/ 37575:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _isFunction =
-/*#__PURE__*/
-__nccwpck_require__(25997);
-
-var lift =
-/*#__PURE__*/
-__nccwpck_require__(53934);
-
-var or =
-/*#__PURE__*/
-__nccwpck_require__(95283);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _isFunction = /*#__PURE__*/__nccwpck_require__(25997);
+var lift = /*#__PURE__*/__nccwpck_require__(53934);
+var or = /*#__PURE__*/__nccwpck_require__(95283);
 /**
  * A function wrapping calls to the two functions in an `||` operation,
  * returning the result of the first function if it is truth-y and the result
@@ -20362,16 +18323,11 @@ __nccwpck_require__(95283);
  *      R.either(Maybe.Just(false), Maybe.Just(55)); // => Maybe.Just(55)
  *      R.either([false, false, 'a'], [11]) // => [11, 11, "a"]
  */
-
-
-var either =
-/*#__PURE__*/
-_curry2(function either(f, g) {
+var either = /*#__PURE__*/_curry2(function either(f, g) {
   return _isFunction(f) ? function _either() {
     return f.apply(this, arguments) || g.apply(this, arguments);
   } : lift(or)(f, g);
 });
-
 module.exports = either;
 
 /***/ }),
@@ -20379,29 +18335,12 @@ module.exports = either;
 /***/ 17063:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var _isArguments =
-/*#__PURE__*/
-__nccwpck_require__(8989);
-
-var _isArray =
-/*#__PURE__*/
-__nccwpck_require__(56999);
-
-var _isObject =
-/*#__PURE__*/
-__nccwpck_require__(80774);
-
-var _isString =
-/*#__PURE__*/
-__nccwpck_require__(59076);
-
-var _isTypedArray =
-/*#__PURE__*/
-__nccwpck_require__(12910);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _isArguments = /*#__PURE__*/__nccwpck_require__(8989);
+var _isArray = /*#__PURE__*/__nccwpck_require__(56999);
+var _isObject = /*#__PURE__*/__nccwpck_require__(80774);
+var _isString = /*#__PURE__*/__nccwpck_require__(59076);
+var _isTypedArray = /*#__PURE__*/__nccwpck_require__(12910);
 /**
  * Returns the empty value of its argument's type. Ramda defines the empty
  * value of Array (`[]`), Object (`{}`), String (`''`),
@@ -20427,17 +18366,12 @@ __nccwpck_require__(12910);
  *      R.empty({x: 1, y: 2});           //=> {}
  *      R.empty(Uint8Array.from('123')); //=> Uint8Array []
  */
-
-
-var empty =
-/*#__PURE__*/
-_curry1(function empty(x) {
+var empty = /*#__PURE__*/_curry1(function empty(x) {
   return x != null && typeof x['fantasy-land/empty'] === 'function' ? x['fantasy-land/empty']() : x != null && x.constructor != null && typeof x.constructor['fantasy-land/empty'] === 'function' ? x.constructor['fantasy-land/empty']() : x != null && typeof x.empty === 'function' ? x.empty() : x != null && x.constructor != null && typeof x.constructor.empty === 'function' ? x.constructor.empty() : _isArray(x) ? [] : _isString(x) ? '' : _isObject(x) ? {} : _isArguments(x) ? function () {
     return arguments;
   }() : _isTypedArray(x) ? x.constructor.from('') : void 0 // else
   ;
 });
-
 module.exports = empty;
 
 /***/ }),
@@ -20445,17 +18379,9 @@ module.exports = empty;
 /***/ 49301:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var equals =
-/*#__PURE__*/
-__nccwpck_require__(50548);
-
-var takeLast =
-/*#__PURE__*/
-__nccwpck_require__(92816);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var equals = /*#__PURE__*/__nccwpck_require__(50548);
+var takeLast = /*#__PURE__*/__nccwpck_require__(92816);
 /**
  * Checks if a list ends with the provided sublist.
  *
@@ -20478,14 +18404,9 @@ __nccwpck_require__(92816);
  *      R.endsWith(['c'], ['a', 'b', 'c'])    //=> true
  *      R.endsWith(['b'], ['a', 'b', 'c'])    //=> false
  */
-
-
-var endsWith =
-/*#__PURE__*/
-_curry2(function (suffix, list) {
+var endsWith = /*#__PURE__*/_curry2(function (suffix, list) {
   return equals(takeLast(suffix.length, list), suffix);
 });
-
 module.exports = endsWith;
 
 /***/ }),
@@ -20493,13 +18414,8 @@ module.exports = endsWith;
 /***/ 88878:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var equals =
-/*#__PURE__*/
-__nccwpck_require__(50548);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var equals = /*#__PURE__*/__nccwpck_require__(50548);
 /**
  * Takes a function and two values in its domain and returns `true` if the
  * values map to the same value in the codomain; `false` otherwise.
@@ -20517,14 +18433,9 @@ __nccwpck_require__(50548);
  *
  *      R.eqBy(Math.abs, 5, -5); //=> true
  */
-
-
-var eqBy =
-/*#__PURE__*/
-_curry3(function eqBy(f, x, y) {
+var eqBy = /*#__PURE__*/_curry3(function eqBy(f, x, y) {
   return equals(f(x), f(y));
 });
-
 module.exports = eqBy;
 
 /***/ }),
@@ -20532,13 +18443,8 @@ module.exports = eqBy;
 /***/ 88919:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var equals =
-/*#__PURE__*/
-__nccwpck_require__(50548);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var equals = /*#__PURE__*/__nccwpck_require__(50548);
 /**
  * Reports whether two objects have the same value, in [`R.equals`](#equals)
  * terms, for the specified property. Useful as a curried predicate.
@@ -20560,14 +18466,9 @@ __nccwpck_require__(50548);
  *      R.eqProps('a', o1, o2); //=> false
  *      R.eqProps('c', o1, o2); //=> true
  */
-
-
-var eqProps =
-/*#__PURE__*/
-_curry3(function eqProps(prop, obj1, obj2) {
+var eqProps = /*#__PURE__*/_curry3(function eqProps(prop, obj1, obj2) {
   return equals(obj1[prop], obj2[prop]);
 });
-
 module.exports = eqProps;
 
 /***/ }),
@@ -20575,13 +18476,8 @@ module.exports = eqProps;
 /***/ 50548:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _equals =
-/*#__PURE__*/
-__nccwpck_require__(71611);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _equals = /*#__PURE__*/__nccwpck_require__(71611);
 /**
  * Returns `true` if its arguments are equivalent, `false` otherwise. Handles
  * cyclical data structures.
@@ -20607,14 +18503,9 @@ __nccwpck_require__(71611);
  *      const b = {}; b.v = b;
  *      R.equals(a, b); //=> true
  */
-
-
-var equals =
-/*#__PURE__*/
-_curry2(function equals(a, b) {
+var equals = /*#__PURE__*/_curry2(function equals(a, b) {
   return _equals(a, b, [], []);
 });
-
 module.exports = equals;
 
 /***/ }),
@@ -20622,17 +18513,9 @@ module.exports = equals;
 /***/ 39042:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _isArray =
-/*#__PURE__*/
-__nccwpck_require__(56999);
-
-var _isObject =
-/*#__PURE__*/
-__nccwpck_require__(80774);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _isArray = /*#__PURE__*/__nccwpck_require__(56999);
+var _isObject = /*#__PURE__*/__nccwpck_require__(80774);
 /**
  * Creates a new object by recursively evolving a shallow copy of `object`,
  * according to the `transformation` functions. All non-primitive properties
@@ -20660,27 +18543,19 @@ __nccwpck_require__(80774);
  *      };
  *      R.evolve(transformations, tomato); //=> {firstName: 'Tomato', data: {elapsed: 101, remaining: 1399}, id:123}
  */
-
-
-var evolve =
-/*#__PURE__*/
-_curry2(function evolve(transformations, object) {
+var evolve = /*#__PURE__*/_curry2(function evolve(transformations, object) {
   if (!_isObject(object) && !_isArray(object)) {
     return object;
   }
-
   var result = object instanceof Array ? [] : {};
   var transformation, key, type;
-
   for (key in object) {
     transformation = transformations[key];
     type = typeof transformation;
     result[key] = type === 'function' ? transformation(object[key]) : transformation && type === 'object' ? evolve(transformation, object[key]) : object[key];
   }
-
   return result;
 });
-
 module.exports = evolve;
 
 /***/ }),
@@ -20688,33 +18563,13 @@ module.exports = evolve;
 /***/ 90983:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _arrayReduce =
-/*#__PURE__*/
-__nccwpck_require__(70374);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _filter =
-/*#__PURE__*/
-__nccwpck_require__(89038);
-
-var _isObject =
-/*#__PURE__*/
-__nccwpck_require__(80774);
-
-var _xfilter =
-/*#__PURE__*/
-__nccwpck_require__(28114);
-
-var keys =
-/*#__PURE__*/
-__nccwpck_require__(96755);
+var _arrayReduce = /*#__PURE__*/__nccwpck_require__(70374);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _filter = /*#__PURE__*/__nccwpck_require__(89038);
+var _isObject = /*#__PURE__*/__nccwpck_require__(80774);
+var _xfilter = /*#__PURE__*/__nccwpck_require__(28114);
+var keys = /*#__PURE__*/__nccwpck_require__(96755);
 /**
  * Takes a predicate and a `Filterable`, and returns a new filterable of the
  * same type containing the members of the given filterable which satisfy the
@@ -20743,23 +18598,16 @@ __nccwpck_require__(96755);
  *
  *      R.filter(isEven, {a: 1, b: 2, c: 3, d: 4}); //=> {b: 2, d: 4}
  */
-
-
-var filter =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable(['fantasy-land/filter', 'filter'], _xfilter, function (pred, filterable) {
+var filter = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable(['fantasy-land/filter', 'filter'], _xfilter, function (pred, filterable) {
   return _isObject(filterable) ? _arrayReduce(function (acc, key) {
     if (pred(filterable[key])) {
       acc[key] = filterable[key];
     }
-
     return acc;
-  }, {}, keys(filterable)) : // else
+  }, {}, keys(filterable)) :
+  // else
   _filter(pred, filterable);
 }));
-
 module.exports = filter;
 
 /***/ }),
@@ -20767,17 +18615,9 @@ module.exports = filter;
 /***/ 4683:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xfind =
-/*#__PURE__*/
-__nccwpck_require__(83668);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xfind = /*#__PURE__*/__nccwpck_require__(83668);
 /**
  * Returns the first element of the list which matches the predicate, or
  * `undefined` if no element matches.
@@ -20802,25 +18642,16 @@ __nccwpck_require__(83668);
  *      R.find(R.propEq(2, 'a'))(xs); //=> {a: 2}
  *      R.find(R.propEq(4, 'a'))(xs); //=> undefined
  */
-
-
-var find =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable(['find'], _xfind, function find(fn, list) {
+var find = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable(['find'], _xfind, function find(fn, list) {
   var idx = 0;
   var len = list.length;
-
   while (idx < len) {
     if (fn(list[idx])) {
       return list[idx];
     }
-
     idx += 1;
   }
 }));
-
 module.exports = find;
 
 /***/ }),
@@ -20828,17 +18659,9 @@ module.exports = find;
 /***/ 16102:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xfindIndex =
-/*#__PURE__*/
-__nccwpck_require__(74571);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xfindIndex = /*#__PURE__*/__nccwpck_require__(74571);
 /**
  * Returns the index of the first element of the list which matches the
  * predicate, or `-1` if no element matches.
@@ -20861,27 +18684,17 @@ __nccwpck_require__(74571);
  *      R.findIndex(R.propEq(2, 'a'))(xs); //=> 1
  *      R.findIndex(R.propEq(4, 'a'))(xs); //=> -1
  */
-
-
-var findIndex =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable([], _xfindIndex, function findIndex(fn, list) {
+var findIndex = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable([], _xfindIndex, function findIndex(fn, list) {
   var idx = 0;
   var len = list.length;
-
   while (idx < len) {
     if (fn(list[idx])) {
       return idx;
     }
-
     idx += 1;
   }
-
   return -1;
 }));
-
 module.exports = findIndex;
 
 /***/ }),
@@ -20889,17 +18702,9 @@ module.exports = findIndex;
 /***/ 93696:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xfindLast =
-/*#__PURE__*/
-__nccwpck_require__(41639);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xfindLast = /*#__PURE__*/__nccwpck_require__(41639);
 /**
  * Returns the last element of the list which matches the predicate, or
  * `undefined` if no element matches.
@@ -20922,24 +18727,15 @@ __nccwpck_require__(41639);
  *      R.findLast(R.propEq(1, 'a'))(xs); //=> {a: 1, b: 1}
  *      R.findLast(R.propEq(4, 'a'))(xs); //=> undefined
  */
-
-
-var findLast =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable([], _xfindLast, function findLast(fn, list) {
+var findLast = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable([], _xfindLast, function findLast(fn, list) {
   var idx = list.length - 1;
-
   while (idx >= 0) {
     if (fn(list[idx])) {
       return list[idx];
     }
-
     idx -= 1;
   }
 }));
-
 module.exports = findLast;
 
 /***/ }),
@@ -20947,17 +18743,9 @@ module.exports = findLast;
 /***/ 47747:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xfindLastIndex =
-/*#__PURE__*/
-__nccwpck_require__(14674);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xfindLastIndex = /*#__PURE__*/__nccwpck_require__(14674);
 /**
  * Returns the index of the last element of the list which matches the
  * predicate, or `-1` if no element matches.
@@ -20980,26 +18768,16 @@ __nccwpck_require__(14674);
  *      R.findLastIndex(R.propEq(1, 'a'))(xs); //=> 1
  *      R.findLastIndex(R.propEq(4, 'a'))(xs); //=> -1
  */
-
-
-var findLastIndex =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable([], _xfindLastIndex, function findLastIndex(fn, list) {
+var findLastIndex = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable([], _xfindLastIndex, function findLastIndex(fn, list) {
   var idx = list.length - 1;
-
   while (idx >= 0) {
     if (fn(list[idx])) {
       return idx;
     }
-
     idx -= 1;
   }
-
   return -1;
 }));
-
 module.exports = findLastIndex;
 
 /***/ }),
@@ -21007,13 +18785,8 @@ module.exports = findLastIndex;
 /***/ 48463:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var _makeFlat =
-/*#__PURE__*/
-__nccwpck_require__(17840);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _makeFlat = /*#__PURE__*/__nccwpck_require__(17840);
 /**
  * Returns a new list by pulling every item out of it (and all its sub-arrays)
  * and putting them in a new array, depth-first.
@@ -21031,14 +18804,7 @@ __nccwpck_require__(17840);
  *      R.flatten([1, 2, [3, 4], 5, [6, [7, 8, [9, [10, 11], 12]]]]);
  *      //=> [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
  */
-
-
-var flatten =
-/*#__PURE__*/
-_curry1(
-/*#__PURE__*/
-_makeFlat(true));
-
+var flatten = /*#__PURE__*/_curry1( /*#__PURE__*/_makeFlat(true));
 module.exports = flatten;
 
 /***/ }),
@@ -21046,13 +18812,8 @@ module.exports = flatten;
 /***/ 95804:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
 /**
  * Returns a new function much like the supplied one, except that the first two
  * arguments' order is reversed.
@@ -21073,11 +18834,7 @@ __nccwpck_require__(61071);
  *      R.flip(mergeThree)(1, 2, 3); //=> [2, 1, 3]
  * @symb R.flip(f)(a, b, c) = f(b, a, c)
  */
-
-
-var flip =
-/*#__PURE__*/
-_curry1(function flip(fn) {
+var flip = /*#__PURE__*/_curry1(function flip(fn) {
   return curryN(fn.length, function (a, b) {
     var args = Array.prototype.slice.call(arguments, 0);
     args[0] = b;
@@ -21085,21 +18842,59 @@ _curry1(function flip(fn) {
     return fn.apply(this, args);
   });
 });
-
 module.exports = flip;
+
+/***/ }),
+
+/***/ 19944:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+var applyTo = /*#__PURE__*/__nccwpck_require__(23395);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _reduce = /*#__PURE__*/__nccwpck_require__(92872);
+/**
+ * Takes the value of an expression and applies it to a function
+ * which is the left-to-right serial composition of the functions
+ * given in the second argument.
+ *
+ * The functions in the pipeline should be unary functions.
+ *
+ * `flow` is helps to avoid introducing an extra function with named arguments
+ * for computing the result of a function pipeline which depends on given initial values.
+ * Rather than defining a referential transparent function `f = (_x, _y) => R.pipe(g(_x), h(_y), …)`
+ * which is only later needed once `z = f(x, y)`,
+ * the introduction of `f`, `_x` and `_y` can be avoided: `z = flow(x, [g, h(y),…]`
+ *
+ * In some libraries this function is named `pipe`.
+ *
+ * @func
+ * @memberOf R
+ * @since v0.30.0
+ * @category Function
+ * @sig a → [(a → b), …, (y → z)] → z
+ * @param {*} a The seed value
+ * @param {Array<Function>} pipeline functions composing the pipeline
+ * @return {*} z The result of applying the seed value to the function pipeline
+ * @see R.pipe
+ * @example
+ *      R.flow(9, [Math.sqrt, R.negate, R.inc]); //=> -2
+ *
+ *      const personObj = { first: 'Jane', last: 'Doe' };
+ *      const fullName = R.flow(personObj, [R.values, R.join(' ')]); //=> "Jane Doe"
+ *      const givenName = R.flow('    ', [R.trim, R.when(R.isEmpty, R.always(fullName))]); //=> "Jane Doe"
+ */
+var flow = /*#__PURE__*/_curry2(function flow(seed, pipeline) {
+  return _reduce(applyTo, seed, pipeline);
+});
+module.exports = flow;
 
 /***/ }),
 
 /***/ 61154:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _checkForMethod =
-/*#__PURE__*/
-__nccwpck_require__(71373);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _checkForMethod = /*#__PURE__*/__nccwpck_require__(71373);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Iterate over an input `list`, calling a provided function `fn` for each
  * element in the list.
@@ -21134,24 +18929,15 @@ __nccwpck_require__(69483);
  *      // logs 8
  * @symb R.forEach(f, [a, b, c]) = [a, b, c]
  */
-
-
-var forEach =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_checkForMethod('forEach', function forEach(fn, list) {
+var forEach = /*#__PURE__*/_curry2( /*#__PURE__*/_checkForMethod('forEach', function forEach(fn, list) {
   var len = list.length;
   var idx = 0;
-
   while (idx < len) {
     fn(list[idx]);
     idx += 1;
   }
-
   return list;
 }));
-
 module.exports = forEach;
 
 /***/ }),
@@ -21159,13 +18945,8 @@ module.exports = forEach;
 /***/ 88941:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var keys =
-/*#__PURE__*/
-__nccwpck_require__(96755);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var keys = /*#__PURE__*/__nccwpck_require__(96755);
 /**
  * Iterate over an input `object`, calling a provided function `fn` for each
  * key and value in the object.
@@ -21188,23 +18969,16 @@ __nccwpck_require__(96755);
  *      // logs y:2
  * @symb R.forEachObjIndexed(f, {x: a, y: b}) = {x: a, y: b}
  */
-
-
-var forEachObjIndexed =
-/*#__PURE__*/
-_curry2(function forEachObjIndexed(fn, obj) {
+var forEachObjIndexed = /*#__PURE__*/_curry2(function forEachObjIndexed(fn, obj) {
   var keyList = keys(obj);
   var idx = 0;
-
   while (idx < keyList.length) {
     var key = keyList[idx];
     fn(obj[key], key, obj);
     idx += 1;
   }
-
   return obj;
 });
-
 module.exports = forEachObjIndexed;
 
 /***/ }),
@@ -21212,9 +18986,7 @@ module.exports = forEachObjIndexed;
 /***/ 3626:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Creates a new object from a list key-value pairs. If a key appears in
  * multiple pairs, the rightmost pair is included in the object.
@@ -21231,22 +19003,15 @@ __nccwpck_require__(60713);
  *
  *      R.fromPairs([['a', 1], ['b', 2], ['c', 3]]); //=> {a: 1, b: 2, c: 3}
  */
-
-
-var fromPairs =
-/*#__PURE__*/
-_curry1(function fromPairs(pairs) {
+var fromPairs = /*#__PURE__*/_curry1(function fromPairs(pairs) {
   var result = {};
   var idx = 0;
-
   while (idx < pairs.length) {
     result[pairs[idx][0]] = pairs[idx][1];
     idx += 1;
   }
-
   return result;
 });
-
 module.exports = fromPairs;
 
 /***/ }),
@@ -21254,17 +19019,9 @@ module.exports = fromPairs;
 /***/ 93397:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _checkForMethod =
-/*#__PURE__*/
-__nccwpck_require__(71373);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var reduceBy =
-/*#__PURE__*/
-__nccwpck_require__(35645);
+var _checkForMethod = /*#__PURE__*/__nccwpck_require__(71373);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var reduceBy = /*#__PURE__*/__nccwpck_require__(35645);
 /**
  * Splits a list into sub-lists stored in an object, based on the result of
  * calling a key-returning function on each element, and grouping the
@@ -21306,19 +19063,10 @@ __nccwpck_require__(35645);
  *      //   'F': [{name: 'Eddy', score: 58}]
  *      // }
  */
-
-
-var groupBy =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_checkForMethod('groupBy',
-/*#__PURE__*/
-reduceBy(function (acc, item) {
+var groupBy = /*#__PURE__*/_curry2( /*#__PURE__*/_checkForMethod('groupBy', /*#__PURE__*/reduceBy(function (acc, item) {
   acc.push(item);
   return acc;
 }, [])));
-
 module.exports = groupBy;
 
 /***/ }),
@@ -21326,9 +19074,7 @@ module.exports = groupBy;
 /***/ 58716:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Takes a list and returns a list of lists where each sublist's elements are
  * all satisfied pairwise comparison according to the provided function.
@@ -21360,29 +19106,20 @@ __nccwpck_require__(69483);
  * R.groupWith(R.eqBy(isVowel), 'aestiou')
  * //=> ['ae', 'st', 'iou']
  */
-
-
-var groupWith =
-/*#__PURE__*/
-_curry2(function (fn, list) {
+var groupWith = /*#__PURE__*/_curry2(function (fn, list) {
   var res = [];
   var idx = 0;
   var len = list.length;
-
   while (idx < len) {
     var nextidx = idx + 1;
-
     while (nextidx < len && fn(list[nextidx - 1], list[nextidx])) {
       nextidx += 1;
     }
-
     res.push(list.slice(idx, nextidx));
     idx = nextidx;
   }
-
   return res;
 });
-
 module.exports = groupWith;
 
 /***/ }),
@@ -21390,9 +19127,7 @@ module.exports = groupWith;
 /***/ 80181:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Returns `true` if the first argument is greater than the second; `false`
  * otherwise.
@@ -21414,14 +19149,9 @@ __nccwpck_require__(69483);
  *      R.gt('a', 'z'); //=> false
  *      R.gt('z', 'a'); //=> true
  */
-
-
-var gt =
-/*#__PURE__*/
-_curry2(function gt(a, b) {
+var gt = /*#__PURE__*/_curry2(function gt(a, b) {
   return a > b;
 });
-
 module.exports = gt;
 
 /***/ }),
@@ -21429,9 +19159,7 @@ module.exports = gt;
 /***/ 93945:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Returns `true` if the first argument is greater than or equal to the second;
  * `false` otherwise.
@@ -21453,14 +19181,9 @@ __nccwpck_require__(69483);
  *      R.gte('a', 'z'); //=> false
  *      R.gte('z', 'a'); //=> true
  */
-
-
-var gte =
-/*#__PURE__*/
-_curry2(function gte(a, b) {
+var gte = /*#__PURE__*/_curry2(function gte(a, b) {
   return a >= b;
 });
-
 module.exports = gte;
 
 /***/ }),
@@ -21468,13 +19191,8 @@ module.exports = gte;
 /***/ 90928:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var hasPath =
-/*#__PURE__*/
-__nccwpck_require__(40578);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var hasPath = /*#__PURE__*/__nccwpck_require__(40578);
 /**
  * Returns whether or not an object has an own property with the specified name
  *
@@ -21499,14 +19217,9 @@ __nccwpck_require__(40578);
  *      pointHas('y');  //=> true
  *      pointHas('z');  //=> false
  */
-
-
-var has =
-/*#__PURE__*/
-_curry2(function has(prop, obj) {
+var has = /*#__PURE__*/_curry2(function has(prop, obj) {
   return hasPath([prop], obj);
 });
-
 module.exports = has;
 
 /***/ }),
@@ -21514,13 +19227,8 @@ module.exports = has;
 /***/ 95076:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var isNil =
-/*#__PURE__*/
-__nccwpck_require__(6895);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var isNil = /*#__PURE__*/__nccwpck_require__(6895);
 /**
  * Returns whether or not an object or its prototype chain has a property with
  * the specified name
@@ -21547,18 +19255,12 @@ __nccwpck_require__(6895);
  *      R.hasIn('width', square);  //=> true
  *      R.hasIn('area', square);  //=> true
  */
-
-
-var hasIn =
-/*#__PURE__*/
-_curry2(function hasIn(prop, obj) {
+var hasIn = /*#__PURE__*/_curry2(function hasIn(prop, obj) {
   if (isNil(obj)) {
     return false;
   }
-
   return prop in obj;
 });
-
 module.exports = hasIn;
 
 /***/ }),
@@ -21566,17 +19268,9 @@ module.exports = hasIn;
 /***/ 40578:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _has =
-/*#__PURE__*/
-__nccwpck_require__(41693);
-
-var isNil =
-/*#__PURE__*/
-__nccwpck_require__(6895);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _has = /*#__PURE__*/__nccwpck_require__(41693);
+var isNil = /*#__PURE__*/__nccwpck_require__(6895);
 /**
  * Returns whether or not a path exists in an object. Only the object's
  * own properties are checked.
@@ -21598,18 +19292,12 @@ __nccwpck_require__(6895);
  *      R.hasPath(['a', 'b'], {a: {c: 2}});         // => false
  *      R.hasPath(['a', 'b'], {});                  // => false
  */
-
-
-var hasPath =
-/*#__PURE__*/
-_curry2(function hasPath(_path, obj) {
+var hasPath = /*#__PURE__*/_curry2(function hasPath(_path, obj) {
   if (_path.length === 0 || isNil(obj)) {
     return false;
   }
-
   var val = obj;
   var idx = 0;
-
   while (idx < _path.length) {
     if (!isNil(val) && _has(_path[idx], val)) {
       val = val[_path[idx]];
@@ -21618,10 +19306,8 @@ _curry2(function hasPath(_path, obj) {
       return false;
     }
   }
-
   return true;
 });
-
 module.exports = hasPath;
 
 /***/ }),
@@ -21629,9 +19315,8 @@ module.exports = hasPath;
 /***/ 8119:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var nth =
-/*#__PURE__*/
-__nccwpck_require__(87280);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _nth = /*#__PURE__*/__nccwpck_require__(88303);
 /**
  * Returns the first element of the given list or string. In some libraries
  * this function is named `first`.
@@ -21641,7 +19326,7 @@ __nccwpck_require__(87280);
  * @since v0.1.0
  * @category List
  * @sig [a] -> a | Undefined
- * @sig String -> String
+ * @sig String -> String | Undefined
  * @param {Array|String} list
  * @return {*}
  * @see R.tail, R.init, R.last
@@ -21651,13 +19336,11 @@ __nccwpck_require__(87280);
  *      R.head([]); //=> undefined
  *
  *      R.head('abc'); //=> 'a'
- *      R.head(''); //=> ''
+ *      R.head(''); //=> undefined
  */
-
-
-var head =
-/*#__PURE__*/
-nth(0);
+var head = /*#__PURE__*/_curry1(function (list) {
+  return _nth(0, list);
+});
 module.exports = head;
 
 /***/ }),
@@ -21665,9 +19348,7 @@ module.exports = head;
 /***/ 50096:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _objectIs =
-/*#__PURE__*/
-__nccwpck_require__(39195);
+var _objectIs = /*#__PURE__*/__nccwpck_require__(39195);
 /**
  * Returns true if its arguments are identical, false otherwise. Values are
  * identical if they reference the same memory. `NaN` is identical to `NaN`;
@@ -21695,36 +19376,31 @@ __nccwpck_require__(39195);
  *      R.identical(0, -0); //=> false
  *      R.identical(NaN, NaN); //=> true
  */
-
-
 var identical = function (a, b) {
   switch (arguments.length) {
     case 0:
       return identical;
-
     case 1:
       return function () {
         return function unaryIdentical(_b) {
           switch (arguments.length) {
             case 0:
               return unaryIdentical;
-
             default:
               return _objectIs(a, _b);
           }
         };
       }();
-
     default:
       return _objectIs(a, b);
   }
-}; // In order to support Cross-origin Window objects as arguments to identical,
+};
+
+// In order to support Cross-origin Window objects as arguments to identical,
 // it cannot be implemented as _curry2(_objectIs).
 // The reason is that _curry2 checks if a function argument is the placeholder __
 // by accessing a paritcular property. However, across URL origins access
 // to most properties of Window is forbidden.
-
-
 module.exports = identical;
 
 /***/ }),
@@ -21732,13 +19408,8 @@ module.exports = identical;
 /***/ 46304:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var _identity =
-/*#__PURE__*/
-__nccwpck_require__(44003);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _identity = /*#__PURE__*/__nccwpck_require__(44003);
 /**
  * A function that does nothing but return the parameter supplied to it. Good
  * as a default or placeholder function.
@@ -21758,12 +19429,7 @@ __nccwpck_require__(44003);
  *      R.identity(obj) === obj; //=> true
  * @symb R.identity(a) = a
  */
-
-
-var identity =
-/*#__PURE__*/
-_curry1(_identity);
-
+var identity = /*#__PURE__*/_curry1(_identity);
 module.exports = identity;
 
 /***/ }),
@@ -21771,13 +19437,8 @@ module.exports = identity;
 /***/ 24852:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
 /**
  * Creates a function that will process either the `onTrue` or the `onFalse`
  * function depending upon the result of the `condition` predicate.
@@ -21805,16 +19466,11 @@ __nccwpck_require__(61071);
  *      incCount({ count: 1 }); //=> { count: 2 }
  *      incCount({});           //=> { count: 1 }
  */
-
-
-var ifElse =
-/*#__PURE__*/
-_curry3(function ifElse(condition, onTrue, onFalse) {
+var ifElse = /*#__PURE__*/_curry3(function ifElse(condition, onTrue, onFalse) {
   return curryN(Math.max(condition.length, onTrue.length, onFalse.length), function _ifElse() {
     return condition.apply(this, arguments) ? onTrue.apply(this, arguments) : onFalse.apply(this, arguments);
   });
 });
-
 module.exports = ifElse;
 
 /***/ }),
@@ -21822,9 +19478,7 @@ module.exports = ifElse;
 /***/ 99963:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var add =
-/*#__PURE__*/
-__nccwpck_require__(38100);
+var add = /*#__PURE__*/__nccwpck_require__(38100);
 /**
  * Increments its argument.
  *
@@ -21840,11 +19494,7 @@ __nccwpck_require__(38100);
  *
  *      R.inc(42); //=> 43
  */
-
-
-var inc =
-/*#__PURE__*/
-add(1);
+var inc = /*#__PURE__*/add(1);
 module.exports = inc;
 
 /***/ }),
@@ -21852,13 +19502,8 @@ module.exports = inc;
 /***/ 47641:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _includes =
-/*#__PURE__*/
-__nccwpck_require__(13148);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _includes = /*#__PURE__*/__nccwpck_require__(13148);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Returns `true` if the specified value is equal, in [`R.equals`](#equals)
  * terms, to at least one element of the given list; `false` otherwise.
@@ -21881,12 +19526,7 @@ __nccwpck_require__(69483);
  *      R.includes([42], [[42]]); //=> true
  *      R.includes('ba', 'banana'); //=>true
  */
-
-
-var includes =
-/*#__PURE__*/
-_curry2(_includes);
-
+var includes = /*#__PURE__*/_curry2(_includes);
 module.exports = includes;
 
 /***/ }),
@@ -21915,6 +19555,7 @@ module.exports.apply = __nccwpck_require__(95062);
 module.exports.applySpec = __nccwpck_require__(3231);
 module.exports.applyTo = __nccwpck_require__(23395);
 module.exports.ascend = __nccwpck_require__(78358);
+module.exports.ascendNatural = __nccwpck_require__(22857);
 module.exports.assoc = __nccwpck_require__(93295);
 module.exports.assocPath = __nccwpck_require__(89947);
 module.exports.binary = __nccwpck_require__(56688);
@@ -21941,6 +19582,7 @@ module.exports.curryN = __nccwpck_require__(61071);
 module.exports.dec = __nccwpck_require__(76536);
 module.exports.defaultTo = __nccwpck_require__(78445);
 module.exports.descend = __nccwpck_require__(53144);
+module.exports.descendNatural = __nccwpck_require__(52051);
 module.exports.difference = __nccwpck_require__(27013);
 module.exports.differenceWith = __nccwpck_require__(29323);
 module.exports.dissoc = __nccwpck_require__(5699);
@@ -21967,6 +19609,7 @@ module.exports.findLast = __nccwpck_require__(93696);
 module.exports.findLastIndex = __nccwpck_require__(47747);
 module.exports.flatten = __nccwpck_require__(48463);
 module.exports.flip = __nccwpck_require__(95804);
+module.exports.flow = __nccwpck_require__(19944);
 module.exports.forEach = __nccwpck_require__(61154);
 module.exports.forEachObjIndexed = __nccwpck_require__(88941);
 module.exports.fromPairs = __nccwpck_require__(3626);
@@ -21998,6 +19641,7 @@ module.exports.invoker = __nccwpck_require__(44910);
 module.exports.is = __nccwpck_require__(4008);
 module.exports.isEmpty = __nccwpck_require__(89838);
 module.exports.isNil = __nccwpck_require__(6895);
+module.exports.isNotEmpty = __nccwpck_require__(83781);
 module.exports.isNotNil = __nccwpck_require__(3013);
 module.exports.join = __nccwpck_require__(33981);
 module.exports.juxt = __nccwpck_require__(21897);
@@ -22166,9 +19810,7 @@ module.exports.thunkify = __nccwpck_require__(71615);
 /***/ 24718:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var reduceBy =
-/*#__PURE__*/
-__nccwpck_require__(35645);
+var reduceBy = /*#__PURE__*/__nccwpck_require__(35645);
 /**
  * Given a function that generates a key, turns a list of objects into an
  * object indexing the objects by the given key. Note that if multiple
@@ -22193,11 +19835,7 @@ __nccwpck_require__(35645);
  *      R.indexBy(R.prop('id'), list);
  *      //=> {abc: {id: 'abc', title: 'B'}, xyz: {id: 'xyz', title: 'A'}}
  */
-
-
-var indexBy =
-/*#__PURE__*/
-reduceBy(function (acc, elem) {
+var indexBy = /*#__PURE__*/reduceBy(function (acc, elem) {
   return elem;
 }, null);
 module.exports = indexBy;
@@ -22207,17 +19845,9 @@ module.exports = indexBy;
 /***/ 92492:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _indexOf =
-/*#__PURE__*/
-__nccwpck_require__(71702);
-
-var _isArray =
-/*#__PURE__*/
-__nccwpck_require__(56999);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _indexOf = /*#__PURE__*/__nccwpck_require__(71702);
+var _isArray = /*#__PURE__*/__nccwpck_require__(56999);
 /**
  * Returns the position of the first occurrence of an item in an array, or -1
  * if the item is not included in the array. [`R.equals`](#equals) is used to
@@ -22237,14 +19867,9 @@ __nccwpck_require__(56999);
  *      R.indexOf(3, [1,2,3,4]); //=> 2
  *      R.indexOf(10, [1,2,3,4]); //=> -1
  */
-
-
-var indexOf =
-/*#__PURE__*/
-_curry2(function indexOf(target, xs) {
+var indexOf = /*#__PURE__*/_curry2(function indexOf(target, xs) {
   return typeof xs.indexOf === 'function' && !_isArray(xs) ? xs.indexOf(target) : _indexOf(xs, target, 0);
 });
-
 module.exports = indexOf;
 
 /***/ }),
@@ -22252,9 +19877,7 @@ module.exports = indexOf;
 /***/ 31508:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var slice =
-/*#__PURE__*/
-__nccwpck_require__(47108);
+var slice = /*#__PURE__*/__nccwpck_require__(47108);
 /**
  * Returns all but the last element of the given list or string.
  *
@@ -22279,11 +19902,7 @@ __nccwpck_require__(47108);
  *      R.init('a');    //=> ''
  *      R.init('');     //=> ''
  */
-
-
-var init =
-/*#__PURE__*/
-slice(0, -1);
+var init = /*#__PURE__*/slice(0, -1);
 module.exports = init;
 
 /***/ }),
@@ -22291,17 +19910,9 @@ module.exports = init;
 /***/ 51951:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _includesWith =
-/*#__PURE__*/
-__nccwpck_require__(53968);
-
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var _filter =
-/*#__PURE__*/
-__nccwpck_require__(89038);
+var _includesWith = /*#__PURE__*/__nccwpck_require__(53968);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var _filter = /*#__PURE__*/__nccwpck_require__(89038);
 /**
  * Takes a predicate `pred`, a list `xs`, and a list `ys`, and returns a list
  * `xs'` comprising each of the elements of `xs` which is equal to one or more
@@ -22337,16 +19948,11 @@ __nccwpck_require__(89038);
  *      );
  *      //=> [{id: 456, name: 'Stephen Stills'}, {id: 177, name: 'Neil Young'}]
  */
-
-
-var innerJoin =
-/*#__PURE__*/
-_curry3(function innerJoin(pred, xs, ys) {
+var innerJoin = /*#__PURE__*/_curry3(function innerJoin(pred, xs, ys) {
   return _filter(function (x) {
     return _includesWith(pred, x, ys);
   }, xs);
 });
-
 module.exports = innerJoin;
 
 /***/ }),
@@ -22354,9 +19960,7 @@ module.exports = innerJoin;
 /***/ 28657:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * Inserts the supplied element into the list, at the specified `index`. _Note that
 
@@ -22376,17 +19980,12 @@ __nccwpck_require__(37597);
  *
  *      R.insert(2, 'x', [1,2,3,4]); //=> [1,2,'x',3,4]
  */
-
-
-var insert =
-/*#__PURE__*/
-_curry3(function insert(idx, elt, list) {
+var insert = /*#__PURE__*/_curry3(function insert(idx, elt, list) {
   idx = idx < list.length && idx >= 0 ? idx : list.length;
   var result = Array.prototype.slice.call(list, 0);
   result.splice(idx, 0, elt);
   return result;
 });
-
 module.exports = insert;
 
 /***/ }),
@@ -22394,9 +19993,7 @@ module.exports = insert;
 /***/ 2017:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * Inserts the sub-list into the list, at the specified `index`. _Note that this is not
  * destructive_: it returns a copy of the list with the changes.
@@ -22415,15 +20012,10 @@ __nccwpck_require__(37597);
  *
  *      R.insertAll(2, ['x','y','z'], [1,2,3,4]); //=> [1,2,'x','y','z',3,4]
  */
-
-
-var insertAll =
-/*#__PURE__*/
-_curry3(function insertAll(idx, elts, list) {
+var insertAll = /*#__PURE__*/_curry3(function insertAll(idx, elts, list) {
   idx = idx < list.length && idx >= 0 ? idx : list.length;
   return [].concat(Array.prototype.slice.call(list, 0, idx), elts, Array.prototype.slice.call(list, idx));
 });
-
 module.exports = insertAll;
 
 /***/ }),
@@ -22431,34 +20023,30 @@ module.exports = insertAll;
 /***/ 71781:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _includes =
-/*#__PURE__*/
-__nccwpck_require__(13148);
-
-var _Set =
-/*#__PURE__*/
-function () {
+var _includes = /*#__PURE__*/__nccwpck_require__(13148);
+var _Set = /*#__PURE__*/function () {
   function _Set() {
     /* globals Set */
     this._nativeSet = typeof Set === 'function' ? new Set() : null;
     this._items = {};
   }
-
   // until we figure out why jsdoc chokes on this
   // @param item The item to add to the Set
   // @returns {boolean} true if the item did not exist prior, otherwise false
   //
   _Set.prototype.add = function (item) {
     return !hasOrAdd(item, true, this);
-  }; //
+  };
+
+  //
   // @param item The item to check for existence in the Set
   // @returns {boolean} true if the item exists in the Set, otherwise false
   //
-
-
   _Set.prototype.has = function (item) {
     return hasOrAdd(item, false, this);
-  }; //
+  };
+
+  //
   // Combines the logic for checking whether an item is a member of the set and
   // for adding a new item to the set.
   //
@@ -22468,15 +20056,11 @@ function () {
   // @param set        The set instance to check or add to.
   // @return {boolean} true if the item already existed, otherwise false.
   //
-
-
   return _Set;
 }();
-
 function hasOrAdd(item, shouldAdd, set) {
   var type = typeof item;
   var prevSize, newSize;
-
   switch (type) {
     case 'string':
     case 'number':
@@ -22488,18 +20072,14 @@ function hasOrAdd(item, shouldAdd, set) {
           if (shouldAdd) {
             set._items['-0'] = true;
           }
-
           return false;
         }
-      } // these types can all utilise the native Set
-
-
+      }
+      // these types can all utilise the native Set
       if (set._nativeSet !== null) {
         if (shouldAdd) {
           prevSize = set._nativeSet.size;
-
           set._nativeSet.add(item);
-
           newSize = set._nativeSet.size;
           return newSize === prevSize;
         } else {
@@ -22511,7 +20091,6 @@ function hasOrAdd(item, shouldAdd, set) {
             set._items[type] = {};
             set._items[type][item] = true;
           }
-
           return false;
         } else if (item in set._items[type]) {
           return true;
@@ -22519,42 +20098,34 @@ function hasOrAdd(item, shouldAdd, set) {
           if (shouldAdd) {
             set._items[type][item] = true;
           }
-
           return false;
         }
       }
-
     case 'boolean':
       // set._items['boolean'] holds a two element array
       // representing [ falseExists, trueExists ]
       if (type in set._items) {
         var bIdx = item ? 1 : 0;
-
         if (set._items[type][bIdx]) {
           return true;
         } else {
           if (shouldAdd) {
             set._items[type][bIdx] = true;
           }
-
           return false;
         }
       } else {
         if (shouldAdd) {
           set._items[type] = item ? [false, true] : [true, false];
         }
-
         return false;
       }
-
     case 'function':
       // compare functions for reference equality
       if (set._nativeSet !== null) {
         if (shouldAdd) {
           prevSize = set._nativeSet.size;
-
           set._nativeSet.add(item);
-
           newSize = set._nativeSet.size;
           return newSize === prevSize;
         } else {
@@ -22565,21 +20136,16 @@ function hasOrAdd(item, shouldAdd, set) {
           if (shouldAdd) {
             set._items[type] = [item];
           }
-
           return false;
         }
-
         if (!_includes(item, set._items[type])) {
           if (shouldAdd) {
             set._items[type].push(item);
           }
-
           return false;
         }
-
         return true;
       }
-
     case 'undefined':
       if (set._items[type]) {
         return true;
@@ -22587,52 +20153,41 @@ function hasOrAdd(item, shouldAdd, set) {
         if (shouldAdd) {
           set._items[type] = true;
         }
-
         return false;
       }
-
     case 'object':
       if (item === null) {
         if (!set._items['null']) {
           if (shouldAdd) {
             set._items['null'] = true;
           }
-
           return false;
         }
-
         return true;
       }
-
     /* falls through */
-
     default:
       // reduce the search size of heterogeneous sets by creating buckets
       // for each type.
       type = Object.prototype.toString.call(item);
-
       if (!(type in set._items)) {
         if (shouldAdd) {
           set._items[type] = [item];
         }
-
         return false;
-      } // scan through all previously applied items
-
-
+      }
+      // scan through all previously applied items
       if (!_includes(item, set._items[type])) {
         if (shouldAdd) {
           set._items[type].push(item);
         }
-
         return false;
       }
-
       return true;
   }
-} // A simple Set type that honours R.equals semantics
+}
 
-
+// A simple Set type that honours R.equals semantics
 module.exports = _Set;
 
 /***/ }),
@@ -22644,15 +20199,12 @@ function _aperture(n, list) {
   var idx = 0;
   var limit = list.length - (n - 1);
   var acc = new Array(limit >= 0 ? limit : 0);
-
   while (idx < limit) {
     acc[idx] = Array.prototype.slice.call(list, idx, idx + n);
     idx += 1;
   }
-
   return acc;
 }
-
 module.exports = _aperture;
 
 /***/ }),
@@ -22667,62 +20219,50 @@ function _arity(n, fn) {
       return function () {
         return fn.apply(this, arguments);
       };
-
     case 1:
       return function (a0) {
         return fn.apply(this, arguments);
       };
-
     case 2:
       return function (a0, a1) {
         return fn.apply(this, arguments);
       };
-
     case 3:
       return function (a0, a1, a2) {
         return fn.apply(this, arguments);
       };
-
     case 4:
       return function (a0, a1, a2, a3) {
         return fn.apply(this, arguments);
       };
-
     case 5:
       return function (a0, a1, a2, a3, a4) {
         return fn.apply(this, arguments);
       };
-
     case 6:
       return function (a0, a1, a2, a3, a4, a5) {
         return fn.apply(this, arguments);
       };
-
     case 7:
       return function (a0, a1, a2, a3, a4, a5, a6) {
         return fn.apply(this, arguments);
       };
-
     case 8:
       return function (a0, a1, a2, a3, a4, a5, a6, a7) {
         return fn.apply(this, arguments);
       };
-
     case 9:
       return function (a0, a1, a2, a3, a4, a5, a6, a7, a8) {
         return fn.apply(this, arguments);
       };
-
     case 10:
       return function (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9) {
         return fn.apply(this, arguments);
       };
-
     default:
       throw new Error('First argument to _arity must be a non-negative integer no greater than ten');
   }
 }
-
 module.exports = _arity;
 
 /***/ }),
@@ -22733,14 +20273,11 @@ module.exports = _arity;
 function _arrayFromIterator(iter) {
   var list = [];
   var next;
-
   while (!(next = iter.next()).done) {
     list.push(next.value);
   }
-
   return list;
 }
-
 module.exports = _arrayFromIterator;
 
 /***/ }),
@@ -22751,15 +20288,12 @@ module.exports = _arrayFromIterator;
 function _arrayReduce(reducer, acc, list) {
   var index = 0;
   var length = list.length;
-
   while (index < length) {
     acc = reducer(acc, list[index]);
     index += 1;
   }
-
   return acc;
 }
-
 module.exports = _arrayReduce;
 
 /***/ }),
@@ -22767,20 +20301,13 @@ module.exports = _arrayReduce;
 /***/ 94549:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _isFunction =
-/*#__PURE__*/
-__nccwpck_require__(25997);
-
-var _toString =
-/*#__PURE__*/
-__nccwpck_require__(40165);
-
+var _isFunction = /*#__PURE__*/__nccwpck_require__(25997);
+var _toString = /*#__PURE__*/__nccwpck_require__(40165);
 function _assertPromise(name, p) {
   if (p == null || !_isFunction(p.then)) {
     throw new TypeError('`' + name + '` expected a Promise, received ' + _toString(p, []));
   }
 }
-
 module.exports = _assertPromise;
 
 /***/ }),
@@ -22788,13 +20315,8 @@ module.exports = _assertPromise;
 /***/ 84702:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _isArray =
-/*#__PURE__*/
-__nccwpck_require__(56999);
-
-var _isInteger =
-/*#__PURE__*/
-__nccwpck_require__(87924);
+var _isArray = /*#__PURE__*/__nccwpck_require__(56999);
+var _isInteger = /*#__PURE__*/__nccwpck_require__(87924);
 /**
  * Makes a shallow clone of an object, setting or overriding the specified
  * property with the given value. Note that this copies and flattens prototype
@@ -22807,25 +20329,19 @@ __nccwpck_require__(87924);
  * @param {Object|Array} obj The object to clone
  * @return {Object|Array} A new object equivalent to the original except for the changed property.
  */
-
-
 function _assoc(prop, val, obj) {
   if (_isInteger(prop) && _isArray(obj)) {
     var arr = [].concat(obj);
     arr[prop] = val;
     return arr;
   }
-
   var result = {};
-
   for (var p in obj) {
     result[p] = obj[p];
   }
-
   result[prop] = val;
   return result;
 }
-
 module.exports = _assoc;
 
 /***/ }),
@@ -22833,9 +20349,7 @@ module.exports = _assoc;
 /***/ 71373:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _isArray =
-/*#__PURE__*/
-__nccwpck_require__(56999);
+var _isArray = /*#__PURE__*/__nccwpck_require__(56999);
 /**
  * This checks whether a function has a [methodname] function. If it isn't an
  * array it will execute that function otherwise it will default to the ramda
@@ -22846,21 +20360,16 @@ __nccwpck_require__(56999);
  * @param {String} methodname property to check for a custom implementation
  * @return {Object} Whatever the return value of the method is.
  */
-
-
 function _checkForMethod(methodname, fn) {
   return function () {
     var length = arguments.length;
-
     if (length === 0) {
       return fn();
     }
-
     var obj = arguments[length - 1];
     return _isArray(obj) || typeof obj[methodname] !== 'function' ? fn.apply(this, arguments) : obj[methodname].apply(obj, Array.prototype.slice.call(arguments, 0, length - 1));
   };
 }
-
 module.exports = _checkForMethod;
 
 /***/ }),
@@ -22868,13 +20377,8 @@ module.exports = _checkForMethod;
 /***/ 12726:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _cloneRegExp =
-/*#__PURE__*/
-__nccwpck_require__(62621);
-
-var type =
-/*#__PURE__*/
-__nccwpck_require__(41193);
+var _cloneRegExp = /*#__PURE__*/__nccwpck_require__(62621);
+var type = /*#__PURE__*/__nccwpck_require__(41193);
 /**
  * Copies an object.
  *
@@ -22883,47 +20387,36 @@ __nccwpck_require__(41193);
  * @param {Boolean} deep Whether or not to perform deep cloning.
  * @return {*} The copied value.
  */
-
-
 function _clone(value, deep, map) {
-  map || (map = new _ObjectMap()); // this avoids the slower switch with a quick if decision removing some milliseconds in each run.
+  map || (map = new _ObjectMap());
 
+  // this avoids the slower switch with a quick if decision removing some milliseconds in each run.
   if (_isPrimitive(value)) {
     return value;
   }
-
   var copy = function copy(copiedValue) {
     // Check for circular and same references on the object graph and return its corresponding clone.
     var cachedCopy = map.get(value);
-
     if (cachedCopy) {
       return cachedCopy;
     }
-
     map.set(value, copiedValue);
-
     for (var key in value) {
       if (Object.prototype.hasOwnProperty.call(value, key)) {
         copiedValue[key] = deep ? _clone(value[key], true, map) : value[key];
       }
     }
-
     return copiedValue;
   };
-
   switch (type(value)) {
     case 'Object':
       return copy(Object.create(Object.getPrototypeOf(value)));
-
     case 'Array':
-      return copy([]);
-
+      return copy(Array(value.length));
     case 'Date':
       return new Date(value.valueOf());
-
     case 'RegExp':
       return _cloneRegExp(value);
-
     case 'Int8Array':
     case 'Uint8Array':
     case 'Uint8ClampedArray':
@@ -22936,86 +20429,65 @@ function _clone(value, deep, map) {
     case 'BigInt64Array':
     case 'BigUint64Array':
       return value.slice();
-
     default:
       return value;
   }
 }
-
 module.exports = _clone;
-
 function _isPrimitive(param) {
   var type = typeof param;
   return param == null || type != 'object' && type != 'function';
 }
-
-var _ObjectMap =
-/*#__PURE__*/
-function () {
+var _ObjectMap = /*#__PURE__*/function () {
   function _ObjectMap() {
     this.map = {};
     this.length = 0;
   }
-
   _ObjectMap.prototype.set = function (key, value) {
-    const hashedKey = this.hash(key);
-    let bucket = this.map[hashedKey];
-
+    var hashedKey = this.hash(key);
+    var bucket = this.map[hashedKey];
     if (!bucket) {
       this.map[hashedKey] = bucket = [];
     }
-
     bucket.push([key, value]);
     this.length += 1;
   };
-
   _ObjectMap.prototype.hash = function (key) {
-    let hashedKey = [];
-
+    var hashedKey = [];
     for (var value in key) {
       hashedKey.push(Object.prototype.toString.call(key[value]));
     }
-
     return hashedKey.join();
   };
-
   _ObjectMap.prototype.get = function (key) {
     /**
      * depending on the number of objects to be cloned is faster to just iterate over the items in the map just because the hash function is so costly,
      * on my tests this number is 180, anything above that using the hash function is faster.
      */
     if (this.length <= 180) {
-      for (const p in this.map) {
-        const bucket = this.map[p];
-
-        for (let i = 0; i < bucket.length; i += 1) {
-          const element = bucket[i];
-
+      for (var p in this.map) {
+        var bucket = this.map[p];
+        for (var i = 0; i < bucket.length; i += 1) {
+          var element = bucket[i];
           if (element[0] === key) {
             return element[1];
           }
         }
       }
-
       return;
     }
-
-    const hashedKey = this.hash(key);
-    const bucket = this.map[hashedKey];
-
+    var hashedKey = this.hash(key);
+    var bucket = this.map[hashedKey];
     if (!bucket) {
       return;
     }
-
-    for (let i = 0; i < bucket.length; i += 1) {
-      const element = bucket[i];
-
+    for (var i = 0; i < bucket.length; i += 1) {
+      var element = bucket[i];
       if (element[0] === key) {
         return element[1];
       }
     }
   };
-
   return _ObjectMap;
 }();
 
@@ -23027,7 +20499,6 @@ function () {
 function _cloneRegExp(pattern) {
   return new RegExp(pattern.source, pattern.flags ? pattern.flags : (pattern.global ? 'g' : '') + (pattern.ignoreCase ? 'i' : '') + (pattern.multiline ? 'm' : '') + (pattern.sticky ? 'y' : '') + (pattern.unicode ? 'u' : '') + (pattern.dotAll ? 's' : ''));
 }
-
 module.exports = _cloneRegExp;
 
 /***/ }),
@@ -23040,7 +20511,6 @@ function _complement(f) {
     return !f.apply(this, arguments);
   };
 }
-
 module.exports = _complement;
 
 /***/ }),
@@ -23067,22 +20537,17 @@ function _concat(set1, set2) {
   var len2 = set2.length;
   var result = [];
   idx = 0;
-
   while (idx < len1) {
     result[result.length] = set1[idx];
     idx += 1;
   }
-
   idx = 0;
-
   while (idx < len2) {
     result[result.length] = set2[idx];
     idx += 1;
   }
-
   return result;
 }
-
 module.exports = _concat;
 
 /***/ }),
@@ -23090,14 +20555,8 @@ module.exports = _concat;
 /***/ 18981:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _arity =
-/*#__PURE__*/
-__nccwpck_require__(31414);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
+var _arity = /*#__PURE__*/__nccwpck_require__(31414);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 function _createPartialApplicator(concat) {
   return _curry2(function (fn, args) {
     return _arity(Math.max(0, fn.length - args.length), function () {
@@ -23105,7 +20564,6 @@ function _createPartialApplicator(concat) {
     });
   });
 }
-
 module.exports = _createPartialApplicator;
 
 /***/ }),
@@ -23113,42 +20571,31 @@ module.exports = _createPartialApplicator;
 /***/ 19348:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _isArrayLike =
-/*#__PURE__*/
-__nccwpck_require__(8490);
-
+var _isArrayLike = /*#__PURE__*/__nccwpck_require__(8490);
 var symIterator = typeof Symbol !== 'undefined' ? Symbol.iterator : '@@iterator';
-
 function _createReduce(arrayReduce, methodReduce, iterableReduce) {
   return function _reduce(xf, acc, list) {
     if (_isArrayLike(list)) {
       return arrayReduce(xf, acc, list);
     }
-
     if (list == null) {
       return acc;
     }
-
     if (typeof list['fantasy-land/reduce'] === 'function') {
       return methodReduce(xf, acc, list, 'fantasy-land/reduce');
     }
-
     if (list[symIterator] != null) {
       return iterableReduce(xf, acc, list[symIterator]());
     }
-
     if (typeof list.next === 'function') {
       return iterableReduce(xf, acc, list);
     }
-
     if (typeof list.reduce === 'function') {
       return methodReduce(xf, acc, list, 'reduce');
     }
-
     throw new TypeError('reduce: list must be array or iterable');
   };
 }
-
 module.exports = _createReduce;
 
 /***/ }),
@@ -23156,9 +20603,7 @@ module.exports = _createReduce;
 /***/ 60713:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _isPlaceholder =
-/*#__PURE__*/
-__nccwpck_require__(71934);
+var _isPlaceholder = /*#__PURE__*/__nccwpck_require__(71934);
 /**
  * Optimized internal one-arity curry function.
  *
@@ -23167,8 +20612,6 @@ __nccwpck_require__(71934);
  * @param {Function} fn The function to curry.
  * @return {Function} The curried function.
  */
-
-
 function _curry1(fn) {
   return function f1(a) {
     if (arguments.length === 0 || _isPlaceholder(a)) {
@@ -23178,7 +20621,6 @@ function _curry1(fn) {
     }
   };
 }
-
 module.exports = _curry1;
 
 /***/ }),
@@ -23186,13 +20628,8 @@ module.exports = _curry1;
 /***/ 69483:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var _isPlaceholder =
-/*#__PURE__*/
-__nccwpck_require__(71934);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _isPlaceholder = /*#__PURE__*/__nccwpck_require__(71934);
 /**
  * Optimized internal two-arity curry function.
  *
@@ -23201,19 +20638,15 @@ __nccwpck_require__(71934);
  * @param {Function} fn The function to curry.
  * @return {Function} The curried function.
  */
-
-
 function _curry2(fn) {
   return function f2(a, b) {
     switch (arguments.length) {
       case 0:
         return f2;
-
       case 1:
         return _isPlaceholder(a) ? f2 : _curry1(function (_b) {
           return fn(a, _b);
         });
-
       default:
         return _isPlaceholder(a) && _isPlaceholder(b) ? f2 : _isPlaceholder(a) ? _curry1(function (_a) {
           return fn(_a, b);
@@ -23223,7 +20656,6 @@ function _curry2(fn) {
     }
   };
 }
-
 module.exports = _curry2;
 
 /***/ }),
@@ -23231,17 +20663,9 @@ module.exports = _curry2;
 /***/ 37597:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _isPlaceholder =
-/*#__PURE__*/
-__nccwpck_require__(71934);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _isPlaceholder = /*#__PURE__*/__nccwpck_require__(71934);
 /**
  * Optimized internal three-arity curry function.
  *
@@ -23250,19 +20674,15 @@ __nccwpck_require__(71934);
  * @param {Function} fn The function to curry.
  * @return {Function} The curried function.
  */
-
-
 function _curry3(fn) {
   return function f3(a, b, c) {
     switch (arguments.length) {
       case 0:
         return f3;
-
       case 1:
         return _isPlaceholder(a) ? f3 : _curry2(function (_b, _c) {
           return fn(a, _b, _c);
         });
-
       case 2:
         return _isPlaceholder(a) && _isPlaceholder(b) ? f3 : _isPlaceholder(a) ? _curry2(function (_a, _c) {
           return fn(_a, b, _c);
@@ -23271,7 +20691,6 @@ function _curry3(fn) {
         }) : _curry1(function (_c) {
           return fn(a, b, _c);
         });
-
       default:
         return _isPlaceholder(a) && _isPlaceholder(b) && _isPlaceholder(c) ? f3 : _isPlaceholder(a) && _isPlaceholder(b) ? _curry2(function (_a, _b) {
           return fn(_a, _b, c);
@@ -23289,7 +20708,6 @@ function _curry3(fn) {
     }
   };
 }
-
 module.exports = _curry3;
 
 /***/ }),
@@ -23297,13 +20715,8 @@ module.exports = _curry3;
 /***/ 14106:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _arity =
-/*#__PURE__*/
-__nccwpck_require__(31414);
-
-var _isPlaceholder =
-/*#__PURE__*/
-__nccwpck_require__(71934);
+var _arity = /*#__PURE__*/__nccwpck_require__(31414);
+var _isPlaceholder = /*#__PURE__*/__nccwpck_require__(71934);
 /**
  * Internal curryN function.
  *
@@ -23314,8 +20727,6 @@ __nccwpck_require__(71934);
  * @param {Function} fn The function to curry.
  * @return {Function} The curried function.
  */
-
-
 function _curryN(length, received, fn) {
   return function () {
     var combined = [];
@@ -23323,32 +20734,25 @@ function _curryN(length, received, fn) {
     var left = length;
     var combinedIdx = 0;
     var hasPlaceholder = false;
-
     while (combinedIdx < received.length || argsIdx < arguments.length) {
       var result;
-
       if (combinedIdx < received.length && (!_isPlaceholder(received[combinedIdx]) || argsIdx >= arguments.length)) {
         result = received[combinedIdx];
       } else {
         result = arguments[argsIdx];
         argsIdx += 1;
       }
-
       combined[combinedIdx] = result;
-
       if (!_isPlaceholder(result)) {
         left -= 1;
       } else {
         hasPlaceholder = true;
       }
-
       combinedIdx += 1;
     }
-
     return !hasPlaceholder && left <= 0 ? fn.apply(this, combined) : _arity(Math.max(0, left), _curryN(length, combined, fn));
   };
 }
-
 module.exports = _curryN;
 
 /***/ }),
@@ -23356,13 +20760,8 @@ module.exports = _curryN;
 /***/ 59699:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _isArray =
-/*#__PURE__*/
-__nccwpck_require__(56999);
-
-var _isTransformer =
-/*#__PURE__*/
-__nccwpck_require__(69949);
+var _isArray = /*#__PURE__*/__nccwpck_require__(56999);
+var _isTransformer = /*#__PURE__*/__nccwpck_require__(69949);
 /**
  * Returns a function that dispatches with different strategies based on the
  * object in list position (last argument). If it is an array, executes [fn].
@@ -23378,37 +20777,28 @@ __nccwpck_require__(69949);
  * @param {Function} fn default ramda implementation
  * @return {Function} A function that dispatches on object in list position
  */
-
-
 function _dispatchable(methodNames, transducerCreator, fn) {
   return function () {
     if (arguments.length === 0) {
       return fn();
     }
-
     var obj = arguments[arguments.length - 1];
-
     if (!_isArray(obj)) {
       var idx = 0;
-
       while (idx < methodNames.length) {
         if (typeof obj[methodNames[idx]] === 'function') {
           return obj[methodNames[idx]].apply(obj, Array.prototype.slice.call(arguments, 0, -1));
         }
-
         idx += 1;
       }
-
       if (_isTransformer(obj)) {
         var transducer = transducerCreator.apply(null, Array.prototype.slice.call(arguments, 0, -1));
         return transducer(obj);
       }
     }
-
     return fn.apply(this, arguments);
   };
 }
-
 module.exports = _dispatchable;
 
 /***/ }),
@@ -23416,17 +20806,9 @@ module.exports = _dispatchable;
 /***/ 95318:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _isInteger =
-/*#__PURE__*/
-__nccwpck_require__(87924);
-
-var _isArray =
-/*#__PURE__*/
-__nccwpck_require__(56999);
-
-var remove =
-/*#__PURE__*/
-__nccwpck_require__(10311);
+var _isInteger = /*#__PURE__*/__nccwpck_require__(87924);
+var _isArray = /*#__PURE__*/__nccwpck_require__(56999);
+var remove = /*#__PURE__*/__nccwpck_require__(10311);
 /**
  * Returns a new object that does not contain a `prop` property.
  *
@@ -23435,27 +20817,20 @@ __nccwpck_require__(10311);
  * @param {Object|Array} obj The object to clone
  * @return {Object} A new object equivalent to the original but without the specified property
  */
-
-
 function _dissoc(prop, obj) {
   if (obj == null) {
     return obj;
   }
-
   if (_isInteger(prop) && _isArray(obj)) {
     return remove(prop, 1, obj);
   }
-
   var result = {};
-
   for (var p in obj) {
     result[p] = obj[p];
   }
-
   delete result[prop];
   return result;
 }
-
 module.exports = _dissoc;
 
 /***/ }),
@@ -23463,14 +20838,10 @@ module.exports = _dissoc;
 /***/ 81166:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var take =
-/*#__PURE__*/
-__nccwpck_require__(61744);
-
+var take = /*#__PURE__*/__nccwpck_require__(61744);
 function dropLast(n, xs) {
   return take(n < xs.length ? xs.length - n : 0, xs);
 }
-
 module.exports = dropLast;
 
 /***/ }),
@@ -23478,20 +20849,14 @@ module.exports = dropLast;
 /***/ 96204:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var slice =
-/*#__PURE__*/
-__nccwpck_require__(47108);
-
+var slice = /*#__PURE__*/__nccwpck_require__(47108);
 function dropLastWhile(pred, xs) {
   var idx = xs.length - 1;
-
   while (idx >= 0 && pred(xs[idx])) {
     idx -= 1;
   }
-
   return slice(0, idx + 1, xs);
 }
-
 module.exports = dropLastWhile;
 
 /***/ }),
@@ -23499,33 +20864,13 @@ module.exports = dropLastWhile;
 /***/ 71611:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _arrayFromIterator =
-/*#__PURE__*/
-__nccwpck_require__(42785);
-
-var _includesWith =
-/*#__PURE__*/
-__nccwpck_require__(53968);
-
-var _functionName =
-/*#__PURE__*/
-__nccwpck_require__(33632);
-
-var _has =
-/*#__PURE__*/
-__nccwpck_require__(41693);
-
-var _objectIs =
-/*#__PURE__*/
-__nccwpck_require__(39195);
-
-var keys =
-/*#__PURE__*/
-__nccwpck_require__(96755);
-
-var type =
-/*#__PURE__*/
-__nccwpck_require__(41193);
+var _arrayFromIterator = /*#__PURE__*/__nccwpck_require__(42785);
+var _includesWith = /*#__PURE__*/__nccwpck_require__(53968);
+var _functionName = /*#__PURE__*/__nccwpck_require__(33632);
+var _has = /*#__PURE__*/__nccwpck_require__(41693);
+var _objectIs = /*#__PURE__*/__nccwpck_require__(39195);
+var keys = /*#__PURE__*/__nccwpck_require__(96755);
+var type = /*#__PURE__*/__nccwpck_require__(41193);
 /**
  * private _uniqContentEquals function.
  * That function is checking equality of 2 iterator contents with 2 assumptions
@@ -23536,42 +20881,32 @@ __nccwpck_require__(41193);
  * - [1,2,3] and [1,2,3,4]
  * - [1,1,1] and [1,2,3]
  * */
-
-
 function _uniqContentEquals(aIterator, bIterator, stackA, stackB) {
   var a = _arrayFromIterator(aIterator);
-
   var b = _arrayFromIterator(bIterator);
-
   function eq(_a, _b) {
     return _equals(_a, _b, stackA.slice(), stackB.slice());
-  } // if *a* array contains any element that is not included in *b*
+  }
 
-
+  // if *a* array contains any element that is not included in *b*
   return !_includesWith(function (b, aItem) {
     return !_includesWith(eq, aItem, b);
   }, b, a);
 }
-
 function _equals(a, b, stackA, stackB) {
   if (_objectIs(a, b)) {
     return true;
   }
-
   var typeA = type(a);
-
   if (typeA !== type(b)) {
     return false;
   }
-
   if (typeof a['fantasy-land/equals'] === 'function' || typeof b['fantasy-land/equals'] === 'function') {
     return typeof a['fantasy-land/equals'] === 'function' && a['fantasy-land/equals'](b) && typeof b['fantasy-land/equals'] === 'function' && b['fantasy-land/equals'](a);
   }
-
   if (typeof a.equals === 'function' || typeof b.equals === 'function') {
     return typeof a.equals === 'function' && a.equals(b) && typeof b.equals === 'function' && b.equals(a);
   }
-
   switch (typeA) {
     case 'Arguments':
     case 'Array':
@@ -23579,61 +20914,45 @@ function _equals(a, b, stackA, stackB) {
       if (typeof a.constructor === 'function' && _functionName(a.constructor) === 'Promise') {
         return a === b;
       }
-
       break;
-
     case 'Boolean':
     case 'Number':
     case 'String':
       if (!(typeof a === typeof b && _objectIs(a.valueOf(), b.valueOf()))) {
         return false;
       }
-
       break;
-
     case 'Date':
       if (!_objectIs(a.valueOf(), b.valueOf())) {
         return false;
       }
-
       break;
-
     case 'Error':
       return a.name === b.name && a.message === b.message;
-
     case 'RegExp':
       if (!(a.source === b.source && a.global === b.global && a.ignoreCase === b.ignoreCase && a.multiline === b.multiline && a.sticky === b.sticky && a.unicode === b.unicode)) {
         return false;
       }
-
       break;
   }
-
   var idx = stackA.length - 1;
-
   while (idx >= 0) {
     if (stackA[idx] === a) {
       return stackB[idx] === b;
     }
-
     idx -= 1;
   }
-
   switch (typeA) {
     case 'Map':
       if (a.size !== b.size) {
         return false;
       }
-
       return _uniqContentEquals(a.entries(), b.entries(), stackA.concat([a]), stackB.concat([b]));
-
     case 'Set':
       if (a.size !== b.size) {
         return false;
       }
-
       return _uniqContentEquals(a.values(), b.values(), stackA.concat([a]), stackB.concat([b]));
-
     case 'Arguments':
     case 'Array':
     case 'Object':
@@ -23654,35 +20973,26 @@ function _equals(a, b, stackA, stackB) {
     case 'Float64Array':
     case 'ArrayBuffer':
       break;
-
     default:
       // Values of other types are only equal if identical.
       return false;
   }
-
   var keysA = keys(a);
-
   if (keysA.length !== keys(b).length) {
     return false;
   }
-
   var extendedStackA = stackA.concat([a]);
   var extendedStackB = stackB.concat([b]);
   idx = keysA.length - 1;
-
   while (idx >= 0) {
     var key = keysA[idx];
-
     if (!(_has(key, b) && _equals(b[key], a[key], extendedStackA, extendedStackB))) {
       return false;
     }
-
     idx -= 1;
   }
-
   return true;
 }
-
 module.exports = _equals;
 
 /***/ }),
@@ -23694,18 +21004,14 @@ function _filter(fn, list) {
   var idx = 0;
   var len = list.length;
   var result = [];
-
   while (idx < len) {
     if (fn(list[idx])) {
       result[result.length] = list[idx];
     }
-
     idx += 1;
   }
-
   return result;
 }
-
 module.exports = _filter;
 
 /***/ }),
@@ -23713,69 +21019,40 @@ module.exports = _filter;
 /***/ 78433:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _forceReduced =
-/*#__PURE__*/
-__nccwpck_require__(60615);
-
-var _isArrayLike =
-/*#__PURE__*/
-__nccwpck_require__(8490);
-
-var _xArrayReduce =
-/*#__PURE__*/
-__nccwpck_require__(51816);
-
-var _xReduce =
-/*#__PURE__*/
-__nccwpck_require__(60694);
-
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
+var _forceReduced = /*#__PURE__*/__nccwpck_require__(60615);
+var _isArrayLike = /*#__PURE__*/__nccwpck_require__(8490);
+var _xArrayReduce = /*#__PURE__*/__nccwpck_require__(51816);
+var _xReduce = /*#__PURE__*/__nccwpck_require__(60694);
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
 var tInit = '@@transducer/init';
 var tStep = '@@transducer/step';
 var tResult = '@@transducer/result';
-
-var XPreservingReduced =
-/*#__PURE__*/
-function () {
+var XPreservingReduced = /*#__PURE__*/function () {
   function XPreservingReduced(xf) {
     this.xf = xf;
   }
-
   XPreservingReduced.prototype[tInit] = _xfBase.init;
   XPreservingReduced.prototype[tResult] = _xfBase.result;
-
   XPreservingReduced.prototype[tStep] = function (result, input) {
     var ret = this.xf[tStep](result, input);
     return ret['@@transducer/reduced'] ? _forceReduced(ret) : ret;
   };
-
   return XPreservingReduced;
 }();
-
-var XFlatCat =
-/*#__PURE__*/
-function () {
+var XFlatCat = /*#__PURE__*/function () {
   function XFlatCat(xf) {
     this.xf = new XPreservingReduced(xf);
   }
-
   XFlatCat.prototype[tInit] = _xfBase.init;
   XFlatCat.prototype[tResult] = _xfBase.result;
-
   XFlatCat.prototype[tStep] = function (result, input) {
     return !_isArrayLike(input) ? _xArrayReduce(this.xf, result, [input]) : _xReduce(this.xf, result, input);
   };
-
   return XFlatCat;
 }();
-
 var _flatCat = function _xcat(xf) {
   return new XFlatCat(xf);
 };
-
 module.exports = _flatCat;
 
 /***/ }),
@@ -23789,7 +21066,6 @@ function _forceReduced(x) {
     '@@transducer/reduced': true
   };
 }
-
 module.exports = _forceReduced;
 
 /***/ }),
@@ -23802,7 +21078,6 @@ function _functionName(f) {
   var match = String(f).match(/^function (\w*)/);
   return match == null ? '' : match[1];
 }
-
 module.exports = _functionName;
 
 /***/ }),
@@ -23813,7 +21088,6 @@ module.exports = _functionName;
 function _has(prop, obj) {
   return Object.prototype.hasOwnProperty.call(obj, prop);
 }
-
 module.exports = _has;
 
 /***/ }),
@@ -23824,7 +21098,6 @@ module.exports = _has;
 function _identity(x) {
   return x;
 }
-
 module.exports = _identity;
 
 /***/ }),
@@ -23832,14 +21105,10 @@ module.exports = _identity;
 /***/ 13148:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _indexOf =
-/*#__PURE__*/
-__nccwpck_require__(71702);
-
+var _indexOf = /*#__PURE__*/__nccwpck_require__(71702);
 function _includes(a, list) {
   return _indexOf(list, a, 0) >= 0;
 }
-
 module.exports = _includes;
 
 /***/ }),
@@ -23850,18 +21119,14 @@ module.exports = _includes;
 function _includesWith(pred, x, list) {
   var idx = 0;
   var len = list.length;
-
   while (idx < len) {
     if (pred(x, list[idx])) {
       return true;
     }
-
     idx += 1;
   }
-
   return false;
 }
-
 module.exports = _includesWith;
 
 /***/ }),
@@ -23869,77 +21134,60 @@ module.exports = _includesWith;
 /***/ 71702:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var equals =
-/*#__PURE__*/
-__nccwpck_require__(50548);
-
+var equals = /*#__PURE__*/__nccwpck_require__(50548);
 function _indexOf(list, a, idx) {
-  var inf, item; // Array.prototype.indexOf doesn't exist below IE9
-
+  var inf, item;
+  // Array.prototype.indexOf doesn't exist below IE9
   if (typeof list.indexOf === 'function') {
     switch (typeof a) {
       case 'number':
         if (a === 0) {
           // manually crawl the list to distinguish between +0 and -0
           inf = 1 / a;
-
           while (idx < list.length) {
             item = list[idx];
-
             if (item === 0 && 1 / item === inf) {
               return idx;
             }
-
             idx += 1;
           }
-
           return -1;
         } else if (a !== a) {
           // NaN
           while (idx < list.length) {
             item = list[idx];
-
             if (typeof item === 'number' && item !== item) {
               return idx;
             }
-
             idx += 1;
           }
-
           return -1;
-        } // non-zero numbers can utilise Set
-
-
+        }
+        // non-zero numbers can utilise Set
         return list.indexOf(a, idx);
-      // all these types can utilise Set
 
+      // all these types can utilise Set
       case 'string':
       case 'boolean':
       case 'function':
       case 'undefined':
         return list.indexOf(a, idx);
-
       case 'object':
         if (a === null) {
           // null can utilise Set
           return list.indexOf(a, idx);
         }
-
     }
-  } // anything else not covered above, defer to R.equals
-
-
+  }
+  // anything else not covered above, defer to R.equals
   while (idx < list.length) {
     if (equals(list[idx], a)) {
       return idx;
     }
-
     idx += 1;
   }
-
   return -1;
 }
-
 module.exports = _indexOf;
 
 /***/ }),
@@ -23947,22 +21195,15 @@ module.exports = _indexOf;
 /***/ 8989:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _has =
-/*#__PURE__*/
-__nccwpck_require__(41693);
-
+var _has = /*#__PURE__*/__nccwpck_require__(41693);
 var toString = Object.prototype.toString;
-
-var _isArguments =
-/*#__PURE__*/
-function () {
+var _isArguments = /*#__PURE__*/function () {
   return toString.call(arguments) === '[object Arguments]' ? function _isArguments(x) {
     return toString.call(x) === '[object Arguments]';
   } : function _isArguments(x) {
     return _has('callee', x);
   };
 }();
-
 module.exports = _isArguments;
 
 /***/ }),
@@ -23991,17 +21232,9 @@ module.exports = Array.isArray || function _isArray(val) {
 /***/ 8490:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var _isArray =
-/*#__PURE__*/
-__nccwpck_require__(56999);
-
-var _isString =
-/*#__PURE__*/
-__nccwpck_require__(59076);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _isArray = /*#__PURE__*/__nccwpck_require__(56999);
+var _isString = /*#__PURE__*/__nccwpck_require__(59076);
 /**
  * Tests whether or not an object is similar to an array.
  *
@@ -24020,38 +21253,27 @@ __nccwpck_require__(59076);
  *      _isArrayLike({0: 'zero', 9: 'nine', length: 10}); //=> true
  *      _isArrayLike({nodeType: 1, length: 1}) // => false
  */
-
-
-var _isArrayLike =
-/*#__PURE__*/
-_curry1(function isArrayLike(x) {
+var _isArrayLike = /*#__PURE__*/_curry1(function isArrayLike(x) {
   if (_isArray(x)) {
     return true;
   }
-
   if (!x) {
     return false;
   }
-
   if (typeof x !== 'object') {
     return false;
   }
-
   if (_isString(x)) {
     return false;
   }
-
   if (x.length === 0) {
     return true;
   }
-
   if (x.length > 0) {
     return x.hasOwnProperty(0) && x.hasOwnProperty(x.length - 1);
   }
-
   return false;
 });
-
 module.exports = _isArrayLike;
 
 /***/ }),
@@ -24063,7 +21285,6 @@ function _isFunction(x) {
   var type = Object.prototype.toString.call(x);
   return type === '[object Function]' || type === '[object AsyncFunction]' || type === '[object GeneratorFunction]' || type === '[object AsyncGeneratorFunction]';
 }
-
 module.exports = _isFunction;
 
 /***/ }),
@@ -24091,7 +21312,6 @@ module.exports = Number.isInteger || function _isInteger(n) {
 function _isNumber(x) {
   return Object.prototype.toString.call(x) === '[object Number]';
 }
-
 module.exports = _isNumber;
 
 /***/ }),
@@ -24102,7 +21322,6 @@ module.exports = _isNumber;
 function _isObject(x) {
   return Object.prototype.toString.call(x) === '[object Object]';
 }
-
 module.exports = _isObject;
 
 /***/ }),
@@ -24113,7 +21332,6 @@ module.exports = _isObject;
 function _isPlaceholder(a) {
   return a != null && typeof a === 'object' && a['@@functional/placeholder'] === true;
 }
-
 module.exports = _isPlaceholder;
 
 /***/ }),
@@ -24124,7 +21342,6 @@ module.exports = _isPlaceholder;
 function _isRegExp(x) {
   return Object.prototype.toString.call(x) === '[object RegExp]';
 }
-
 module.exports = _isRegExp;
 
 /***/ }),
@@ -24135,7 +21352,6 @@ module.exports = _isRegExp;
 function _isString(x) {
   return Object.prototype.toString.call(x) === '[object String]';
 }
-
 module.exports = _isString;
 
 /***/ }),
@@ -24146,7 +21362,6 @@ module.exports = _isString;
 function _isTransformer(obj) {
   return obj != null && typeof obj['@@transducer/step'] === 'function';
 }
-
 module.exports = _isTransformer;
 
 /***/ }),
@@ -24172,7 +21387,6 @@ function _isTypedArray(val) {
   var type = Object.prototype.toString.call(val);
   return type === '[object Uint8ClampedArray]' || type === '[object Int8Array]' || type === '[object Uint8Array]' || type === '[object Int16Array]' || type === '[object Uint16Array]' || type === '[object Int32Array]' || type === '[object Uint32Array]' || type === '[object Float32Array]' || type === '[object Float64Array]' || type === '[object BigInt64Array]' || type === '[object BigUint64Array]';
 }
-
 module.exports = _isTypedArray;
 
 /***/ }),
@@ -24180,30 +21394,24 @@ module.exports = _isTypedArray;
 /***/ 17840:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _isArrayLike =
-/*#__PURE__*/
-__nccwpck_require__(8490);
+var _isArrayLike = /*#__PURE__*/__nccwpck_require__(8490);
 /**
  * `_makeFlat` is a helper function that returns a one-level or fully recursive
  * function based on the flag passed in.
  *
  * @private
  */
-
-
 function _makeFlat(recursive) {
   return function flatt(list) {
     var value, jlen, j;
     var result = [];
     var idx = 0;
     var ilen = list.length;
-
     while (idx < ilen) {
       if (_isArrayLike(list[idx])) {
         value = recursive ? flatt(list[idx]) : list[idx];
         j = 0;
         jlen = value.length;
-
         while (j < jlen) {
           result[result.length] = value[j];
           j += 1;
@@ -24211,14 +21419,11 @@ function _makeFlat(recursive) {
       } else {
         result[result.length] = list[idx];
       }
-
       idx += 1;
     }
-
     return result;
   };
 }
-
 module.exports = _makeFlat;
 
 /***/ }),
@@ -24230,15 +21435,12 @@ function _map(fn, functor) {
   var idx = 0;
   var len = functor.length;
   var result = Array(len);
-
   while (idx < len) {
     result[idx] = fn(functor[idx]);
     idx += 1;
   }
-
   return result;
 }
-
 module.exports = _map;
 
 /***/ }),
@@ -24246,13 +21448,8 @@ module.exports = _map;
 /***/ 9245:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _isArray =
-/*#__PURE__*/
-__nccwpck_require__(56999);
-
-var _isInteger =
-/*#__PURE__*/
-__nccwpck_require__(87924);
+var _isArray = /*#__PURE__*/__nccwpck_require__(56999);
+var _isInteger = /*#__PURE__*/__nccwpck_require__(87924);
 /**
  * Makes a shallow clone of an object, applying the given fn to the specified
  * property with the given value. Note that this copies and flattens prototype
@@ -24265,49 +21462,48 @@ __nccwpck_require__(87924);
  * @param {Object|Array} obj The object to clone
  * @return {Object|Array} A new object equivalent to the original except for the changed property.
  */
-
-
 function _modify(prop, fn, obj) {
   if (_isInteger(prop) && _isArray(obj)) {
     var arr = [].concat(obj);
     arr[prop] = fn(arr[prop]);
     return arr;
   }
-
   var result = {};
-
   for (var p in obj) {
     result[p] = obj[p];
   }
-
   result[prop] = fn(result[prop]);
   return result;
 }
-
 module.exports = _modify;
+
+/***/ }),
+
+/***/ 88303:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+var _isString = /*#__PURE__*/__nccwpck_require__(59076);
+function _nth(offset, list) {
+  var idx = offset < 0 ? list.length + offset : offset;
+  return _isString(list) ? list.charAt(idx) : list[idx];
+}
+module.exports = _nth;
 
 /***/ }),
 
 /***/ 95291:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _has =
-/*#__PURE__*/
-__nccwpck_require__(41693); // Based on https://developer.mozilla.org/en/docs/Web/JavaScript/Reference/Global_Objects/Object/assign
-
-
+var _has = /*#__PURE__*/__nccwpck_require__(41693); // Based on https://developer.mozilla.org/en/docs/Web/JavaScript/Reference/Global_Objects/Object/assign
 function _objectAssign(target) {
   if (target == null) {
     throw new TypeError('Cannot convert undefined or null to object');
   }
-
   var output = Object(target);
   var idx = 1;
   var length = arguments.length;
-
   while (idx < length) {
     var source = arguments[idx];
-
     if (source != null) {
       for (var nextKey in source) {
         if (_has(nextKey, source)) {
@@ -24315,13 +21511,10 @@ function _objectAssign(target) {
         }
       }
     }
-
     idx += 1;
   }
-
   return output;
 }
-
 module.exports = typeof Object.assign === 'function' ? Object.assign : _objectAssign;
 
 /***/ }),
@@ -24341,8 +21534,31 @@ function _objectIs(a, b) {
     return a !== a && b !== b;
   }
 }
-
 module.exports = typeof Object.is === 'function' ? Object.is : _objectIs;
+
+/***/ }),
+
+/***/ 57538:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+var _isInteger = /*#__PURE__*/__nccwpck_require__(87924);
+var _nth = /*#__PURE__*/__nccwpck_require__(88303);
+function _path(pathAr, obj) {
+  var val = obj;
+  for (var i = 0; i < pathAr.length; i += 1) {
+    if (val == null) {
+      return undefined;
+    }
+    var p = pathAr[i];
+    if (_isInteger(p)) {
+      val = _nth(p, val);
+    } else {
+      val = val[p];
+    }
+  }
+  return val;
+}
+module.exports = _path;
 
 /***/ }),
 
@@ -24354,7 +21570,6 @@ function _pipe(f, g) {
     return g.call(this, f.apply(this, arguments));
   };
 }
-
 module.exports = _pipe;
 
 /***/ }),
@@ -24367,7 +21582,6 @@ function _promap(f, g, profunctor) {
     return g(profunctor(f(x)));
   };
 }
-
 module.exports = _promap;
 
 /***/ }),
@@ -24380,7 +21594,6 @@ function _quote(s) {
   .replace(/\f/g, '\\f').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t').replace(/\v/g, '\\v').replace(/\0/g, '\\0');
   return '"' + escaped.replace(/"/g, '\\"') + '"';
 }
-
 module.exports = _quote;
 
 /***/ }),
@@ -24388,33 +21601,20 @@ module.exports = _quote;
 /***/ 92872:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _arrayReduce =
-/*#__PURE__*/
-__nccwpck_require__(70374);
-
-var _createReduce =
-/*#__PURE__*/
-__nccwpck_require__(19348);
-
+var _arrayReduce = /*#__PURE__*/__nccwpck_require__(70374);
+var _createReduce = /*#__PURE__*/__nccwpck_require__(19348);
 function _iterableReduce(reducer, acc, iter) {
   var step = iter.next();
-
   while (!step.done) {
     acc = reducer(acc, step.value);
     step = iter.next();
   }
-
   return acc;
 }
-
 function _methodReduce(reducer, acc, obj, methodName) {
   return obj[methodName](reducer, acc);
 }
-
-var _reduce =
-/*#__PURE__*/
-_createReduce(_arrayReduce, _methodReduce, _iterableReduce);
-
+var _reduce = /*#__PURE__*/_createReduce(_arrayReduce, _methodReduce, _iterableReduce);
 module.exports = _reduce;
 
 /***/ }),
@@ -24428,7 +21628,6 @@ function _reduced(x) {
     '@@transducer/reduced': true
   };
 }
-
 module.exports = _reduced;
 
 /***/ }),
@@ -24436,26 +21635,11 @@ module.exports = _reduced;
 /***/ 78808:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _objectAssign =
-/*#__PURE__*/
-__nccwpck_require__(95291);
-
-var _identity =
-/*#__PURE__*/
-__nccwpck_require__(44003);
-
-var _isArrayLike =
-/*#__PURE__*/
-__nccwpck_require__(8490);
-
-var _isTransformer =
-/*#__PURE__*/
-__nccwpck_require__(69949);
-
-var objOf =
-/*#__PURE__*/
-__nccwpck_require__(24572);
-
+var _objectAssign = /*#__PURE__*/__nccwpck_require__(95291);
+var _identity = /*#__PURE__*/__nccwpck_require__(44003);
+var _isArrayLike = /*#__PURE__*/__nccwpck_require__(8490);
+var _isTransformer = /*#__PURE__*/__nccwpck_require__(69949);
+var objOf = /*#__PURE__*/__nccwpck_require__(24572);
 var _stepCatArray = {
   '@@transducer/init': Array,
   '@@transducer/step': function (xs, x) {
@@ -24478,27 +21662,21 @@ var _stepCatObject = {
   },
   '@@transducer/result': _identity
 };
-
 function _stepCat(obj) {
   if (_isTransformer(obj)) {
     return obj;
   }
-
   if (_isArrayLike(obj)) {
     return _stepCatArray;
   }
-
   if (typeof obj === 'string') {
     return _stepCatString;
   }
-
   if (typeof obj === 'object') {
     return _stepCatObject;
   }
-
   throw new Error('Cannot create transformer for ' + obj);
 }
-
 module.exports = _stepCat;
 
 /***/ }),
@@ -24512,13 +21690,11 @@ module.exports = _stepCat;
 var pad = function pad(n) {
   return (n < 10 ? '0' : '') + n;
 };
-
 var _toISOString = typeof Date.prototype.toISOString === 'function' ? function _toISOString(d) {
   return d.toISOString();
 } : function _toISOString(d) {
   return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate()) + 'T' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds()) + '.' + (d.getUTCMilliseconds() / 1000).toFixed(3).slice(2, 5) + 'Z';
 };
-
 module.exports = _toISOString;
 
 /***/ }),
@@ -24526,89 +21702,57 @@ module.exports = _toISOString;
 /***/ 40165:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _includes =
-/*#__PURE__*/
-__nccwpck_require__(13148);
-
-var _map =
-/*#__PURE__*/
-__nccwpck_require__(38077);
-
-var _quote =
-/*#__PURE__*/
-__nccwpck_require__(29543);
-
-var _toISOString =
-/*#__PURE__*/
-__nccwpck_require__(35222);
-
-var keys =
-/*#__PURE__*/
-__nccwpck_require__(96755);
-
-var reject =
-/*#__PURE__*/
-__nccwpck_require__(71545);
-
+var _includes = /*#__PURE__*/__nccwpck_require__(13148);
+var _map = /*#__PURE__*/__nccwpck_require__(38077);
+var _quote = /*#__PURE__*/__nccwpck_require__(29543);
+var _toISOString = /*#__PURE__*/__nccwpck_require__(35222);
+var keys = /*#__PURE__*/__nccwpck_require__(96755);
+var reject = /*#__PURE__*/__nccwpck_require__(71545);
 function _toString(x, seen) {
   var recur = function recur(y) {
     var xs = seen.concat([x]);
     return _includes(y, xs) ? '<Circular>' : _toString(y, xs);
-  }; //  mapPairs :: (Object, [String]) -> [String]
+  };
 
-
+  //  mapPairs :: (Object, [String]) -> [String]
   var mapPairs = function (obj, keys) {
     return _map(function (k) {
       return _quote(k) + ': ' + recur(obj[k]);
     }, keys.slice().sort());
   };
-
   switch (Object.prototype.toString.call(x)) {
     case '[object Arguments]':
       return '(function() { return arguments; }(' + _map(recur, x).join(', ') + '))';
-
     case '[object Array]':
       return '[' + _map(recur, x).concat(mapPairs(x, reject(function (k) {
         return /^\d+$/.test(k);
       }, keys(x)))).join(', ') + ']';
-
     case '[object Boolean]':
       return typeof x === 'object' ? 'new Boolean(' + recur(x.valueOf()) + ')' : x.toString();
-
     case '[object Date]':
       return 'new Date(' + (isNaN(x.valueOf()) ? recur(NaN) : _quote(_toISOString(x))) + ')';
-
     case '[object Map]':
       return 'new Map(' + recur(Array.from(x)) + ')';
-
     case '[object Null]':
       return 'null';
-
     case '[object Number]':
       return typeof x === 'object' ? 'new Number(' + recur(x.valueOf()) + ')' : 1 / x === -Infinity ? '-0' : x.toString(10);
-
     case '[object Set]':
       return 'new Set(' + recur(Array.from(x).sort()) + ')';
-
     case '[object String]':
       return typeof x === 'object' ? 'new String(' + recur(x.valueOf()) + ')' : _quote(x);
-
     case '[object Undefined]':
       return 'undefined';
-
     default:
       if (typeof x.toString === 'function') {
         var repr = x.toString();
-
         if (repr !== '[object Object]') {
           return repr;
         }
       }
-
       return '{' + mapPairs(x, keys(x)).join(', ') + '}';
   }
 }
-
 module.exports = _toString;
 
 /***/ }),
@@ -24619,21 +21763,16 @@ module.exports = _toString;
 function _xArrayReduce(xf, acc, list) {
   var idx = 0;
   var len = list.length;
-
   while (idx < len) {
     acc = xf['@@transducer/step'](acc, list[idx]);
-
     if (acc && acc['@@transducer/reduced']) {
       acc = acc['@@transducer/value'];
       break;
     }
-
     idx += 1;
   }
-
   return xf['@@transducer/result'](acc);
 }
-
 module.exports = _xArrayReduce;
 
 /***/ }),
@@ -24641,43 +21780,25 @@ module.exports = _xArrayReduce;
 /***/ 60694:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _createReduce =
-/*#__PURE__*/
-__nccwpck_require__(19348);
-
-var _xArrayReduce =
-/*#__PURE__*/
-__nccwpck_require__(51816);
-
-var bind =
-/*#__PURE__*/
-__nccwpck_require__(44458);
-
+var _createReduce = /*#__PURE__*/__nccwpck_require__(19348);
+var _xArrayReduce = /*#__PURE__*/__nccwpck_require__(51816);
+var bind = /*#__PURE__*/__nccwpck_require__(44458);
 function _xIterableReduce(xf, acc, iter) {
   var step = iter.next();
-
   while (!step.done) {
     acc = xf['@@transducer/step'](acc, step.value);
-
     if (acc && acc['@@transducer/reduced']) {
       acc = acc['@@transducer/value'];
       break;
     }
-
     step = iter.next();
   }
-
   return xf['@@transducer/result'](acc);
 }
-
 function _xMethodReduce(xf, acc, obj, methodName) {
   return xf['@@transducer/result'](obj[methodName](bind(xf['@@transducer/step'], xf), acc));
 }
-
-var _xReduce =
-/*#__PURE__*/
-_createReduce(_xArrayReduce, _xMethodReduce, _xIterableReduce);
-
+var _xReduce = /*#__PURE__*/_createReduce(_xArrayReduce, _xMethodReduce, _xIterableReduce);
 module.exports = _xReduce;
 
 /***/ }),
@@ -24685,51 +21806,35 @@ module.exports = _xReduce;
 /***/ 65023:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _reduced =
-/*#__PURE__*/
-__nccwpck_require__(59400);
-
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XAll =
-/*#__PURE__*/
-function () {
+var _reduced = /*#__PURE__*/__nccwpck_require__(59400);
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XAll = /*#__PURE__*/function () {
   function XAll(f, xf) {
     this.xf = xf;
     this.f = f;
     this.all = true;
   }
-
   XAll.prototype['@@transducer/init'] = _xfBase.init;
-
   XAll.prototype['@@transducer/result'] = function (result) {
     if (this.all) {
       result = this.xf['@@transducer/step'](result, true);
     }
-
     return this.xf['@@transducer/result'](result);
   };
-
   XAll.prototype['@@transducer/step'] = function (result, input) {
     if (!this.f(input)) {
       this.all = false;
       result = _reduced(this.xf['@@transducer/step'](result, false));
     }
-
     return result;
   };
-
   return XAll;
 }();
-
 function _xall(f) {
   return function (xf) {
     return new XAll(f, xf);
   };
 }
-
 module.exports = _xall;
 
 /***/ }),
@@ -24737,51 +21842,35 @@ module.exports = _xall;
 /***/ 35447:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _reduced =
-/*#__PURE__*/
-__nccwpck_require__(59400);
-
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XAny =
-/*#__PURE__*/
-function () {
+var _reduced = /*#__PURE__*/__nccwpck_require__(59400);
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XAny = /*#__PURE__*/function () {
   function XAny(f, xf) {
     this.xf = xf;
     this.f = f;
     this.any = false;
   }
-
   XAny.prototype['@@transducer/init'] = _xfBase.init;
-
   XAny.prototype['@@transducer/result'] = function (result) {
     if (!this.any) {
       result = this.xf['@@transducer/step'](result, false);
     }
-
     return this.xf['@@transducer/result'](result);
   };
-
   XAny.prototype['@@transducer/step'] = function (result, input) {
     if (this.f(input)) {
       this.any = true;
       result = _reduced(this.xf['@@transducer/step'](result, true));
     }
-
     return result;
   };
-
   return XAny;
 }();
-
 function _xany(f) {
   return function (xf) {
     return new XAny(f, xf);
   };
 }
-
 module.exports = _xany;
 
 /***/ }),
@@ -24789,59 +21878,42 @@ module.exports = _xany;
 /***/ 77156:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _concat =
-/*#__PURE__*/
-__nccwpck_require__(68118);
-
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XAperture =
-/*#__PURE__*/
-function () {
+var _concat = /*#__PURE__*/__nccwpck_require__(68118);
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XAperture = /*#__PURE__*/function () {
   function XAperture(n, xf) {
     this.xf = xf;
     this.pos = 0;
     this.full = false;
     this.acc = new Array(n);
   }
-
   XAperture.prototype['@@transducer/init'] = _xfBase.init;
-
   XAperture.prototype['@@transducer/result'] = function (result) {
     this.acc = null;
     return this.xf['@@transducer/result'](result);
   };
-
   XAperture.prototype['@@transducer/step'] = function (result, input) {
     this.store(input);
     return this.full ? this.xf['@@transducer/step'](result, this.getCopy()) : result;
   };
-
   XAperture.prototype.store = function (input) {
     this.acc[this.pos] = input;
     this.pos += 1;
-
     if (this.pos === this.acc.length) {
       this.pos = 0;
       this.full = true;
     }
   };
-
   XAperture.prototype.getCopy = function () {
     return _concat(Array.prototype.slice.call(this.acc, this.pos), Array.prototype.slice.call(this.acc, 0, this.pos));
   };
-
   return XAperture;
 }();
-
 function _xaperture(n) {
   return function (xf) {
     return new XAperture(n, xf);
   };
 }
-
 module.exports = _xaperture;
 
 /***/ }),
@@ -24849,20 +21921,13 @@ module.exports = _xaperture;
 /***/ 73620:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _flatCat =
-/*#__PURE__*/
-__nccwpck_require__(78433);
-
-var _xmap =
-/*#__PURE__*/
-__nccwpck_require__(58542);
-
+var _flatCat = /*#__PURE__*/__nccwpck_require__(78433);
+var _xmap = /*#__PURE__*/__nccwpck_require__(58542);
 function _xchain(f) {
   return function (xf) {
     return _xmap(f)(_flatCat(xf));
   };
 }
-
 module.exports = _xchain;
 
 /***/ }),
@@ -24870,39 +21935,28 @@ module.exports = _xchain;
 /***/ 79796:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XDrop =
-/*#__PURE__*/
-function () {
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XDrop = /*#__PURE__*/function () {
   function XDrop(n, xf) {
     this.xf = xf;
     this.n = n;
   }
-
   XDrop.prototype['@@transducer/init'] = _xfBase.init;
   XDrop.prototype['@@transducer/result'] = _xfBase.result;
-
   XDrop.prototype['@@transducer/step'] = function (result, input) {
     if (this.n > 0) {
       this.n -= 1;
       return result;
     }
-
     return this.xf['@@transducer/step'](result, input);
   };
-
   return XDrop;
 }();
-
 function _xdrop(n) {
   return function (xf) {
     return new XDrop(n, xf);
   };
 }
-
 module.exports = _xdrop;
 
 /***/ }),
@@ -24910,59 +21964,44 @@ module.exports = _xdrop;
 /***/ 73750:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XDropLast =
-/*#__PURE__*/
-function () {
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XDropLast = /*#__PURE__*/function () {
   function XDropLast(n, xf) {
     if (n <= 0) {
       return xf;
     }
-
     this.xf = xf;
     this.pos = 0;
     this.full = false;
     this.acc = new Array(n);
   }
-
   XDropLast.prototype['@@transducer/init'] = _xfBase.init;
-
   XDropLast.prototype['@@transducer/result'] = function (result) {
     this.acc = null;
     return this.xf['@@transducer/result'](result);
   };
-
   XDropLast.prototype['@@transducer/step'] = function (result, input) {
     if (this.full) {
       result = this.xf['@@transducer/step'](result, this.acc[this.pos]);
     }
-
     this.store(input);
     return result;
   };
-
   XDropLast.prototype.store = function (input) {
     this.acc[this.pos] = input;
     this.pos += 1;
-
     if (this.pos === this.acc.length) {
       this.pos = 0;
       this.full = true;
     }
   };
-
   return XDropLast;
 }();
-
 function _xdropLast(n) {
   return function (xf) {
     return new XDropLast(n, xf);
   };
 }
-
 module.exports = _xdropLast;
 
 /***/ }),
@@ -24970,54 +22009,38 @@ module.exports = _xdropLast;
 /***/ 56957:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var _xReduce =
-/*#__PURE__*/
-__nccwpck_require__(60694);
-
-var XDropLastWhile =
-/*#__PURE__*/
-function () {
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var _xReduce = /*#__PURE__*/__nccwpck_require__(60694);
+var XDropLastWhile = /*#__PURE__*/function () {
   function XDropLastWhile(fn, xf) {
     this.f = fn;
     this.retained = [];
     this.xf = xf;
   }
-
   XDropLastWhile.prototype['@@transducer/init'] = _xfBase.init;
-
   XDropLastWhile.prototype['@@transducer/result'] = function (result) {
     this.retained = null;
     return this.xf['@@transducer/result'](result);
   };
-
   XDropLastWhile.prototype['@@transducer/step'] = function (result, input) {
     return this.f(input) ? this.retain(result, input) : this.flush(result, input);
   };
-
   XDropLastWhile.prototype.flush = function (result, input) {
     result = _xReduce(this.xf, result, this.retained);
     this.retained = [];
     return this.xf['@@transducer/step'](result, input);
   };
-
   XDropLastWhile.prototype.retain = function (result, input) {
     this.retained.push(input);
     return result;
   };
-
   return XDropLastWhile;
 }();
-
 function _xdropLastWhile(fn) {
   return function (xf) {
     return new XDropLastWhile(fn, xf);
   };
 }
-
 module.exports = _xdropLastWhile;
 
 /***/ }),
@@ -25025,45 +22048,33 @@ module.exports = _xdropLastWhile;
 /***/ 81349:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XDropRepeatsWith =
-/*#__PURE__*/
-function () {
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XDropRepeatsWith = /*#__PURE__*/function () {
   function XDropRepeatsWith(pred, xf) {
     this.xf = xf;
     this.pred = pred;
     this.lastValue = undefined;
     this.seenFirstValue = false;
   }
-
   XDropRepeatsWith.prototype['@@transducer/init'] = _xfBase.init;
   XDropRepeatsWith.prototype['@@transducer/result'] = _xfBase.result;
-
   XDropRepeatsWith.prototype['@@transducer/step'] = function (result, input) {
     var sameAsLast = false;
-
     if (!this.seenFirstValue) {
       this.seenFirstValue = true;
     } else if (this.pred(this.lastValue, input)) {
       sameAsLast = true;
     }
-
     this.lastValue = input;
     return sameAsLast ? result : this.xf['@@transducer/step'](result, input);
   };
-
   return XDropRepeatsWith;
 }();
-
 function _xdropRepeatsWith(pred) {
   return function (xf) {
     return new XDropRepeatsWith(pred, xf);
   };
 }
-
 module.exports = _xdropRepeatsWith;
 
 /***/ }),
@@ -25071,42 +22082,30 @@ module.exports = _xdropRepeatsWith;
 /***/ 72591:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XDropWhile =
-/*#__PURE__*/
-function () {
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XDropWhile = /*#__PURE__*/function () {
   function XDropWhile(f, xf) {
     this.xf = xf;
     this.f = f;
   }
-
   XDropWhile.prototype['@@transducer/init'] = _xfBase.init;
   XDropWhile.prototype['@@transducer/result'] = _xfBase.result;
-
   XDropWhile.prototype['@@transducer/step'] = function (result, input) {
     if (this.f) {
       if (this.f(input)) {
         return result;
       }
-
       this.f = null;
     }
-
     return this.xf['@@transducer/step'](result, input);
   };
-
   return XDropWhile;
 }();
-
 function _xdropWhile(f) {
   return function (xf) {
     return new XDropWhile(f, xf);
   };
 }
-
 module.exports = _xdropWhile;
 
 /***/ }),
@@ -25128,34 +22127,24 @@ module.exports = {
 /***/ 28114:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XFilter =
-/*#__PURE__*/
-function () {
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XFilter = /*#__PURE__*/function () {
   function XFilter(f, xf) {
     this.xf = xf;
     this.f = f;
   }
-
   XFilter.prototype['@@transducer/init'] = _xfBase.init;
   XFilter.prototype['@@transducer/result'] = _xfBase.result;
-
   XFilter.prototype['@@transducer/step'] = function (result, input) {
     return this.f(input) ? this.xf['@@transducer/step'](result, input) : result;
   };
-
   return XFilter;
 }();
-
 function _xfilter(f) {
   return function (xf) {
     return new XFilter(f, xf);
   };
 }
-
 module.exports = _xfilter;
 
 /***/ }),
@@ -25163,51 +22152,35 @@ module.exports = _xfilter;
 /***/ 83668:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _reduced =
-/*#__PURE__*/
-__nccwpck_require__(59400);
-
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XFind =
-/*#__PURE__*/
-function () {
+var _reduced = /*#__PURE__*/__nccwpck_require__(59400);
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XFind = /*#__PURE__*/function () {
   function XFind(f, xf) {
     this.xf = xf;
     this.f = f;
     this.found = false;
   }
-
   XFind.prototype['@@transducer/init'] = _xfBase.init;
-
   XFind.prototype['@@transducer/result'] = function (result) {
     if (!this.found) {
       result = this.xf['@@transducer/step'](result, void 0);
     }
-
     return this.xf['@@transducer/result'](result);
   };
-
   XFind.prototype['@@transducer/step'] = function (result, input) {
     if (this.f(input)) {
       this.found = true;
       result = _reduced(this.xf['@@transducer/step'](result, input));
     }
-
     return result;
   };
-
   return XFind;
 }();
-
 function _xfind(f) {
   return function (xf) {
     return new XFind(f, xf);
   };
 }
-
 module.exports = _xfind;
 
 /***/ }),
@@ -25215,54 +22188,37 @@ module.exports = _xfind;
 /***/ 74571:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _reduced =
-/*#__PURE__*/
-__nccwpck_require__(59400);
-
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XFindIndex =
-/*#__PURE__*/
-function () {
+var _reduced = /*#__PURE__*/__nccwpck_require__(59400);
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XFindIndex = /*#__PURE__*/function () {
   function XFindIndex(f, xf) {
     this.xf = xf;
     this.f = f;
     this.idx = -1;
     this.found = false;
   }
-
   XFindIndex.prototype['@@transducer/init'] = _xfBase.init;
-
   XFindIndex.prototype['@@transducer/result'] = function (result) {
     if (!this.found) {
       result = this.xf['@@transducer/step'](result, -1);
     }
-
     return this.xf['@@transducer/result'](result);
   };
-
   XFindIndex.prototype['@@transducer/step'] = function (result, input) {
     this.idx += 1;
-
     if (this.f(input)) {
       this.found = true;
       result = _reduced(this.xf['@@transducer/step'](result, this.idx));
     }
-
     return result;
   };
-
   return XFindIndex;
 }();
-
 function _xfindIndex(f) {
   return function (xf) {
     return new XFindIndex(f, xf);
   };
 }
-
 module.exports = _xfindIndex;
 
 /***/ }),
@@ -25270,41 +22226,29 @@ module.exports = _xfindIndex;
 /***/ 41639:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XFindLast =
-/*#__PURE__*/
-function () {
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XFindLast = /*#__PURE__*/function () {
   function XFindLast(f, xf) {
     this.xf = xf;
     this.f = f;
   }
-
   XFindLast.prototype['@@transducer/init'] = _xfBase.init;
-
   XFindLast.prototype['@@transducer/result'] = function (result) {
     return this.xf['@@transducer/result'](this.xf['@@transducer/step'](result, this.last));
   };
-
   XFindLast.prototype['@@transducer/step'] = function (result, input) {
     if (this.f(input)) {
       this.last = input;
     }
-
     return result;
   };
-
   return XFindLast;
 }();
-
 function _xfindLast(f) {
   return function (xf) {
     return new XFindLast(f, xf);
   };
 }
-
 module.exports = _xfindLast;
 
 /***/ }),
@@ -25312,45 +22256,32 @@ module.exports = _xfindLast;
 /***/ 14674:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XFindLastIndex =
-/*#__PURE__*/
-function () {
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XFindLastIndex = /*#__PURE__*/function () {
   function XFindLastIndex(f, xf) {
     this.xf = xf;
     this.f = f;
     this.idx = -1;
     this.lastIdx = -1;
   }
-
   XFindLastIndex.prototype['@@transducer/init'] = _xfBase.init;
-
   XFindLastIndex.prototype['@@transducer/result'] = function (result) {
     return this.xf['@@transducer/result'](this.xf['@@transducer/step'](result, this.lastIdx));
   };
-
   XFindLastIndex.prototype['@@transducer/step'] = function (result, input) {
     this.idx += 1;
-
     if (this.f(input)) {
       this.lastIdx = this.idx;
     }
-
     return result;
   };
-
   return XFindLastIndex;
 }();
-
 function _xfindLastIndex(f) {
   return function (xf) {
     return new XFindLastIndex(f, xf);
   };
 }
-
 module.exports = _xfindLastIndex;
 
 /***/ }),
@@ -25358,34 +22289,24 @@ module.exports = _xfindLastIndex;
 /***/ 58542:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XMap =
-/*#__PURE__*/
-function () {
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XMap = /*#__PURE__*/function () {
   function XMap(f, xf) {
     this.xf = xf;
     this.f = f;
   }
-
   XMap.prototype['@@transducer/init'] = _xfBase.init;
   XMap.prototype['@@transducer/result'] = _xfBase.result;
-
   XMap.prototype['@@transducer/step'] = function (result, input) {
     return this.xf['@@transducer/step'](result, this.f(input));
   };
-
   return XMap;
 }();
-
 var _xmap = function _xmap(f) {
   return function (xf) {
     return new XMap(f, xf);
   };
 };
-
 module.exports = _xmap;
 
 /***/ }),
@@ -25393,39 +22314,26 @@ module.exports = _xmap;
 /***/ 86093:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var _promap =
-/*#__PURE__*/
-__nccwpck_require__(55843);
-
-var XPromap =
-/*#__PURE__*/
-function () {
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var _promap = /*#__PURE__*/__nccwpck_require__(55843);
+var XPromap = /*#__PURE__*/function () {
   function XPromap(f, g, xf) {
     this.xf = xf;
     this.f = f;
     this.g = g;
   }
-
   XPromap.prototype['@@transducer/init'] = _xfBase.init;
   XPromap.prototype['@@transducer/result'] = _xfBase.result;
-
   XPromap.prototype['@@transducer/step'] = function (result, input) {
     return this.xf['@@transducer/step'](result, _promap(this.f, this.g, input));
   };
-
   return XPromap;
 }();
-
 function _xpromap(f, g) {
   return function (xf) {
     return new XPromap(f, g, xf);
   };
 }
-
 module.exports = _xpromap;
 
 /***/ }),
@@ -25433,21 +22341,10 @@ module.exports = _xpromap;
 /***/ 20248:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _clone =
-/*#__PURE__*/
-__nccwpck_require__(12726);
-
-var _has =
-/*#__PURE__*/
-__nccwpck_require__(41693);
-
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XReduceBy =
-/*#__PURE__*/
-function () {
+var _clone = /*#__PURE__*/__nccwpck_require__(12726);
+var _has = /*#__PURE__*/__nccwpck_require__(41693);
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XReduceBy = /*#__PURE__*/function () {
   function XReduceBy(valueFn, valueAcc, keyFn, xf) {
     this.valueFn = valueFn;
     this.valueAcc = valueAcc;
@@ -25455,43 +22352,34 @@ function () {
     this.xf = xf;
     this.inputs = {};
   }
-
   XReduceBy.prototype['@@transducer/init'] = _xfBase.init;
-
   XReduceBy.prototype['@@transducer/result'] = function (result) {
     var key;
-
     for (key in this.inputs) {
       if (_has(key, this.inputs)) {
         result = this.xf['@@transducer/step'](result, this.inputs[key]);
-
         if (result['@@transducer/reduced']) {
           result = result['@@transducer/value'];
           break;
         }
       }
     }
-
     this.inputs = null;
     return this.xf['@@transducer/result'](result);
   };
-
   XReduceBy.prototype['@@transducer/step'] = function (result, input) {
     var key = this.keyFn(input);
     this.inputs[key] = this.inputs[key] || [key, _clone(this.valueAcc, false)];
     this.inputs[key][1] = this.valueFn(this.inputs[key][1], input);
     return result;
   };
-
   return XReduceBy;
 }();
-
 function _xreduceBy(valueFn, valueAcc, keyFn) {
   return function (xf) {
     return new XReduceBy(valueFn, valueAcc, keyFn, xf);
   };
 }
-
 module.exports = _xreduceBy;
 
 /***/ }),
@@ -25499,50 +22387,32 @@ module.exports = _xreduceBy;
 /***/ 84586:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
 var tInit = '@@transducer/init';
 var tStep = '@@transducer/step';
-
-var XScan =
-/*#__PURE__*/
-function () {
+var XScan = /*#__PURE__*/function () {
   function XScan(reducer, acc, xf) {
     this.xf = xf;
     this.f = reducer;
     this.acc = acc;
   }
-
   XScan.prototype[tInit] = function () {
     return this.xf[tStep](this.xf[tInit](), this.acc);
   };
-
   XScan.prototype['@@transducer/result'] = _xfBase.result;
-
   XScan.prototype[tStep] = function (result, input) {
     if (result['@@transducer/reduced']) {
       return result;
     }
-
     this.acc = this.f(this.acc, input);
     return this.xf[tStep](result, this.acc);
   };
-
   return XScan;
 }();
-
-var _xscan =
-/*#__PURE__*/
-_curry3(function _xscan(reducer, acc, xf) {
+var _xscan = /*#__PURE__*/_curry3(function _xscan(reducer, acc, xf) {
   return new XScan(reducer, acc, xf);
 });
-
 module.exports = _xscan;
 
 /***/ }),
@@ -25550,41 +22420,28 @@ module.exports = _xscan;
 /***/ 51664:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _reduced =
-/*#__PURE__*/
-__nccwpck_require__(59400);
-
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XTake =
-/*#__PURE__*/
-function () {
+var _reduced = /*#__PURE__*/__nccwpck_require__(59400);
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XTake = /*#__PURE__*/function () {
   function XTake(n, xf) {
     this.xf = xf;
     this.n = n;
     this.i = 0;
   }
-
   XTake.prototype['@@transducer/init'] = _xfBase.init;
   XTake.prototype['@@transducer/result'] = _xfBase.result;
-
   XTake.prototype['@@transducer/step'] = function (result, input) {
     this.i += 1;
     var ret = this.n === 0 ? result : this.xf['@@transducer/step'](result, input);
     return this.n >= 0 && this.i >= this.n ? _reduced(ret) : ret;
   };
-
   return XTake;
 }();
-
 function _xtake(n) {
   return function (xf) {
     return new XTake(n, xf);
   };
 }
-
 module.exports = _xtake;
 
 /***/ }),
@@ -25592,38 +22449,25 @@ module.exports = _xtake;
 /***/ 75265:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _reduced =
-/*#__PURE__*/
-__nccwpck_require__(59400);
-
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XTakeWhile =
-/*#__PURE__*/
-function () {
+var _reduced = /*#__PURE__*/__nccwpck_require__(59400);
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XTakeWhile = /*#__PURE__*/function () {
   function XTakeWhile(f, xf) {
     this.xf = xf;
     this.f = f;
   }
-
   XTakeWhile.prototype['@@transducer/init'] = _xfBase.init;
   XTakeWhile.prototype['@@transducer/result'] = _xfBase.result;
-
   XTakeWhile.prototype['@@transducer/step'] = function (result, input) {
     return this.f(input) ? this.xf['@@transducer/step'](result, input) : _reduced(result);
   };
-
   return XTakeWhile;
 }();
-
 function _xtakeWhile(f) {
   return function (xf) {
     return new XTakeWhile(f, xf);
   };
 }
-
 module.exports = _xtakeWhile;
 
 /***/ }),
@@ -25631,35 +22475,25 @@ module.exports = _xtakeWhile;
 /***/ 73269:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XTap =
-/*#__PURE__*/
-function () {
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XTap = /*#__PURE__*/function () {
   function XTap(f, xf) {
     this.xf = xf;
     this.f = f;
   }
-
   XTap.prototype['@@transducer/init'] = _xfBase.init;
   XTap.prototype['@@transducer/result'] = _xfBase.result;
-
   XTap.prototype['@@transducer/step'] = function (result, input) {
     this.f(input);
     return this.xf['@@transducer/step'](result, input);
   };
-
   return XTap;
 }();
-
 function _xtap(f) {
   return function (xf) {
     return new XTap(f, xf);
   };
 }
-
 module.exports = _xtap;
 
 /***/ }),
@@ -25667,39 +22501,26 @@ module.exports = _xtap;
 /***/ 9931:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _Set =
-/*#__PURE__*/
-__nccwpck_require__(71781);
-
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XUniqBy =
-/*#__PURE__*/
-function () {
+var _Set = /*#__PURE__*/__nccwpck_require__(71781);
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XUniqBy = /*#__PURE__*/function () {
   function XUniqBy(f, xf) {
     this.xf = xf;
     this.f = f;
     this.set = new _Set();
   }
-
   XUniqBy.prototype['@@transducer/init'] = _xfBase.init;
   XUniqBy.prototype['@@transducer/result'] = _xfBase.result;
-
   XUniqBy.prototype['@@transducer/step'] = function (result, input) {
     return this.set.add(this.f(input)) ? this.xf['@@transducer/step'](result, input) : result;
   };
-
   return XUniqBy;
 }();
-
 function _xuniqBy(f) {
   return function (xf) {
     return new XUniqBy(f, xf);
   };
 }
-
 module.exports = _xuniqBy;
 
 /***/ }),
@@ -25707,26 +22528,16 @@ module.exports = _xuniqBy;
 /***/ 64902:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _includesWith =
-/*#__PURE__*/
-__nccwpck_require__(53968);
-
-var _xfBase =
-/*#__PURE__*/
-__nccwpck_require__(20485);
-
-var XUniqWith =
-/*#__PURE__*/
-function () {
+var _includesWith = /*#__PURE__*/__nccwpck_require__(53968);
+var _xfBase = /*#__PURE__*/__nccwpck_require__(20485);
+var XUniqWith = /*#__PURE__*/function () {
   function XUniqWith(pred, xf) {
     this.xf = xf;
     this.pred = pred;
     this.items = [];
   }
-
   XUniqWith.prototype['@@transducer/init'] = _xfBase.init;
   XUniqWith.prototype['@@transducer/result'] = _xfBase.result;
-
   XUniqWith.prototype['@@transducer/step'] = function (result, input) {
     if (_includesWith(this.pred, input, this.items)) {
       return result;
@@ -25735,16 +22546,13 @@ function () {
       return this.xf['@@transducer/step'](result, input);
     }
   };
-
   return XUniqWith;
 }();
-
 function _xuniqWith(pred) {
   return function (xf) {
     return new XUniqWith(pred, xf);
   };
 }
-
 module.exports = _xuniqWith;
 
 /***/ }),
@@ -25752,32 +22560,24 @@ module.exports = _xuniqWith;
 /***/ 97393:
 /***/ ((module) => {
 
-var XWrap =
-/*#__PURE__*/
-function () {
+var XWrap = /*#__PURE__*/function () {
   function XWrap(fn) {
     this.f = fn;
   }
-
   XWrap.prototype['@@transducer/init'] = function () {
     throw new Error('init not implemented on XWrap');
   };
-
   XWrap.prototype['@@transducer/result'] = function (acc) {
     return acc;
   };
-
   XWrap.prototype['@@transducer/step'] = function (acc, x) {
     return this.f(acc, x);
   };
-
   return XWrap;
 }();
-
 function _xwrap(fn) {
   return new XWrap(fn);
 }
-
 module.exports = _xwrap;
 
 /***/ }),
@@ -25785,21 +22585,10 @@ module.exports = _xwrap;
 /***/ 86984:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _filter =
-/*#__PURE__*/
-__nccwpck_require__(89038);
-
-var _Set =
-/*#__PURE__*/
-__nccwpck_require__(71781);
-
-var uniq =
-/*#__PURE__*/
-__nccwpck_require__(70272);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _filter = /*#__PURE__*/__nccwpck_require__(89038);
+var _Set = /*#__PURE__*/__nccwpck_require__(71781);
+var uniq = /*#__PURE__*/__nccwpck_require__(70272);
 /**
  * Combines two lists into a set (i.e. no duplicates) composed of those
  * elements common to both lists.
@@ -25817,20 +22606,13 @@ __nccwpck_require__(70272);
  *
  *      R.intersection([1,2,3,4], [7,6,5,4,3]); //=> [4, 3]
  */
-
-
-var intersection =
-/*#__PURE__*/
-_curry2(function intersection(list1, list2) {
+var intersection = /*#__PURE__*/_curry2(function intersection(list1, list2) {
   var toKeep = new _Set();
-
   for (var i = 0; i < list1.length; i += 1) {
     toKeep.add(list1[i]);
   }
-
   return uniq(_filter(toKeep.has.bind(toKeep), list2));
 });
-
 module.exports = intersection;
 
 /***/ }),
@@ -25838,13 +22620,8 @@ module.exports = intersection;
 /***/ 41823:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _checkForMethod =
-/*#__PURE__*/
-__nccwpck_require__(71373);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _checkForMethod = /*#__PURE__*/__nccwpck_require__(71373);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Creates a new list with the separator interposed between elements.
  *
@@ -25862,30 +22639,25 @@ __nccwpck_require__(69483);
  *
  *      R.intersperse('a', ['b', 'n', 'n', 's']); //=> ['b', 'a', 'n', 'a', 'n', 'a', 's']
  */
-
-
-var intersperse =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_checkForMethod('intersperse', function intersperse(separator, list) {
-  var out = [];
-  var idx = 0;
+var intersperse = /*#__PURE__*/_curry2( /*#__PURE__*/_checkForMethod('intersperse', function _intersperse(separator, list) {
   var length = list.length;
-
+  if (length === 0) {
+    return [];
+  }
+  var out = Array(length * 2 - 1);
+  var idx = 0;
   while (idx < length) {
+    var i = idx * 2;
     if (idx === length - 1) {
-      out.push(list[idx]);
+      out[i] = list[idx];
     } else {
-      out.push(list[idx], separator);
+      out[i] = list[idx];
+      out[i + 1] = separator;
     }
-
     idx += 1;
   }
-
   return out;
 }));
-
 module.exports = intersperse;
 
 /***/ }),
@@ -25893,21 +22665,10 @@ module.exports = intersperse;
 /***/ 11375:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var _isTransformer =
-/*#__PURE__*/
-__nccwpck_require__(69949);
-
-var _xReduce =
-/*#__PURE__*/
-__nccwpck_require__(60694);
-
-var _stepCat =
-/*#__PURE__*/
-__nccwpck_require__(78808);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var _isTransformer = /*#__PURE__*/__nccwpck_require__(69949);
+var _xReduce = /*#__PURE__*/__nccwpck_require__(60694);
+var _stepCat = /*#__PURE__*/__nccwpck_require__(78808);
 /**
  * Transforms the items of the list with the transducer and appends the
  * transformed items to the accumulator using an appropriate iterator function
@@ -25947,15 +22708,10 @@ __nccwpck_require__(78808);
  *      const intoArray = R.into([]);
  *      intoArray(transducer, numbers); //=> [2, 3]
  */
-
-
-var into =
-/*#__PURE__*/
-_curry3(function into(acc, transducer, list) {
+var into = /*#__PURE__*/_curry3(function into(acc, transducer, list) {
   var xf = transducer(_isTransformer(acc) ? acc : _stepCat(acc));
   return _xReduce(xf, xf['@@transducer/init'](), list);
 });
-
 module.exports = into;
 
 /***/ }),
@@ -25963,17 +22719,9 @@ module.exports = into;
 /***/ 43680:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var _has =
-/*#__PURE__*/
-__nccwpck_require__(41693);
-
-var keys =
-/*#__PURE__*/
-__nccwpck_require__(96755);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _has = /*#__PURE__*/__nccwpck_require__(41693);
+var keys = /*#__PURE__*/__nccwpck_require__(96755);
 /**
  * Same as [`R.invertObj`](#invertObj), however this accounts for objects with
  * duplicate values by putting the values into an array.
@@ -25996,16 +22744,11 @@ __nccwpck_require__(96755);
  *      R.invert(raceResultsByFirstName);
  *      //=> { 'alice': ['first', 'third'], 'jake':['second'] }
  */
-
-
-var invert =
-/*#__PURE__*/
-_curry1(function invert(obj) {
+var invert = /*#__PURE__*/_curry1(function invert(obj) {
   var props = keys(obj);
   var len = props.length;
   var idx = 0;
   var out = {};
-
   while (idx < len) {
     var key = props[idx];
     var val = obj[key];
@@ -26013,10 +22756,8 @@ _curry1(function invert(obj) {
     list[list.length] = key;
     idx += 1;
   }
-
   return out;
 });
-
 module.exports = invert;
 
 /***/ }),
@@ -26024,13 +22765,8 @@ module.exports = invert;
 /***/ 60272:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var keys =
-/*#__PURE__*/
-__nccwpck_require__(96755);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var keys = /*#__PURE__*/__nccwpck_require__(96755);
 /**
  * Returns a new object with the keys of the given object as values, and the
  * values of the given object, which are coerced to strings, as keys. Note
@@ -26058,25 +22794,18 @@ __nccwpck_require__(96755);
  *      R.invertObj(raceResults);
  *      //=> { 'alice': '0', 'jake':'1' }
  */
-
-
-var invertObj =
-/*#__PURE__*/
-_curry1(function invertObj(obj) {
+var invertObj = /*#__PURE__*/_curry1(function invertObj(obj) {
   var props = keys(obj);
   var len = props.length;
   var idx = 0;
   var out = {};
-
   while (idx < len) {
     var key = props[idx];
     out[obj[key]] = key;
     idx += 1;
   }
-
   return out;
 });
-
 module.exports = invertObj;
 
 /***/ }),
@@ -26084,21 +22813,10 @@ module.exports = invertObj;
 /***/ 44910:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _isFunction =
-/*#__PURE__*/
-__nccwpck_require__(25997);
-
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
-
-var toString =
-/*#__PURE__*/
-__nccwpck_require__(76119);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _isFunction = /*#__PURE__*/__nccwpck_require__(25997);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
+var toString = /*#__PURE__*/__nccwpck_require__(76119);
 /**
  * Given an `arity` (Number) and a `name` (String) the `invoker` function
  * returns a curried function that takes `arity` arguments and a `context`
@@ -26141,22 +22859,15 @@ __nccwpck_require__(76119);
  * @symb R.invoker(1, 'method')(a, o) = o['method'](a)
  * @symb R.invoker(2, 'method')(a, b, o) = o['method'](a, b)
  */
-
-
-var invoker =
-/*#__PURE__*/
-_curry2(function invoker(arity, method) {
+var invoker = /*#__PURE__*/_curry2(function invoker(arity, method) {
   return curryN(arity + 1, function () {
     var target = arguments[arity];
-
     if (target != null && _isFunction(target[method])) {
       return target[method].apply(target, Array.prototype.slice.call(arguments, 0, arity));
     }
-
     throw new TypeError(toString(target) + ' does not have a method named "' + method + '"');
   });
 });
-
 module.exports = invoker;
 
 /***/ }),
@@ -26164,9 +22875,7 @@ module.exports = invoker;
 /***/ 4008:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * See if an object (i.e. `val`) is an instance of the supplied constructor. This
  * function will check up the inheritance chain, if any.
@@ -26191,14 +22900,9 @@ __nccwpck_require__(69483);
  *      R.is(Object, 's'); //=> false
  *      R.is(Number, {}); //=> false
  */
-
-
-var is =
-/*#__PURE__*/
-_curry2(function is(Ctor, val) {
+var is = /*#__PURE__*/_curry2(function is(Ctor, val) {
   return val instanceof Ctor || val != null && (val.constructor === Ctor || Ctor.name === 'Object' && typeof val === 'object');
 });
-
 module.exports = is;
 
 /***/ }),
@@ -26206,17 +22910,9 @@ module.exports = is;
 /***/ 89838:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var empty =
-/*#__PURE__*/
-__nccwpck_require__(17063);
-
-var equals =
-/*#__PURE__*/
-__nccwpck_require__(50548);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var empty = /*#__PURE__*/__nccwpck_require__(17063);
+var equals = /*#__PURE__*/__nccwpck_require__(50548);
 /**
  * Returns `true` if the given value is its type's empty value; `false`
  * otherwise.
@@ -26228,7 +22924,7 @@ __nccwpck_require__(50548);
  * @sig a -> Boolean
  * @param {*} x
  * @return {Boolean}
- * @see R.empty
+ * @see R.empty, R.isNotEmpty
  * @example
  *
  *      R.isEmpty([1, 2, 3]);           //=> false
@@ -26239,14 +22935,9 @@ __nccwpck_require__(50548);
  *      R.isEmpty({length: 0});         //=> false
  *      R.isEmpty(Uint8Array.from('')); //=> true
  */
-
-
-var isEmpty =
-/*#__PURE__*/
-_curry1(function isEmpty(x) {
+var isEmpty = /*#__PURE__*/_curry1(function isEmpty(x) {
   return x != null && equals(x, empty(x));
 });
-
 module.exports = isEmpty;
 
 /***/ }),
@@ -26254,9 +22945,7 @@ module.exports = isEmpty;
 /***/ 6895:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Checks if the input value is `null` or `undefined`.
  *
@@ -26274,28 +22963,52 @@ __nccwpck_require__(60713);
  *      R.isNil(0); //=> false
  *      R.isNil([]); //=> false
  */
-
-
-var isNil =
-/*#__PURE__*/
-_curry1(function isNil(x) {
+var isNil = /*#__PURE__*/_curry1(function isNil(x) {
   return x == null;
 });
-
 module.exports = isNil;
+
+/***/ }),
+
+/***/ 83781:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var isEmpty = /*#__PURE__*/__nccwpck_require__(89838);
+/**
+ * Returns `false` if the given value is its type's empty value; `true`
+ * otherwise.
+ *
+ * @func
+ * @memberOf R
+ * @since v0.29.2
+ * @category Logic
+ * @sig a -> Boolean
+ * @param {*} x
+ * @return {Boolean}
+ * @see R.empty, R.isEmpty
+ * @example
+ *
+ *      R.isNotEmpty([1, 2, 3]);           //=> true
+ *      R.isNotEmpty([]);                  //=> false
+ *      R.isNotEmpty('');                  //=> false
+ *      R.isNotEmpty(null);                //=> true
+ *      R.isNotEmpty({});                  //=> false
+ *      R.isNotEmpty({length: 0});         //=> true
+ *      R.isNotEmpty(Uint8Array.from('')); //=> false
+ */
+var isNotEmpty = /*#__PURE__*/_curry1(function isNotEmpty(x) {
+  return !isEmpty(x);
+});
+module.exports = isNotEmpty;
 
 /***/ }),
 
 /***/ 3013:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var isNil =
-/*#__PURE__*/
-__nccwpck_require__(6895);
-
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var isNil = /*#__PURE__*/__nccwpck_require__(6895);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Checks if the input value is not `null` and not `undefined`.
  *
@@ -26313,14 +23026,9 @@ __nccwpck_require__(60713);
  *      R.isNotNil(0); //=> true
  *      R.isNotNil([]); //=> true
  */
-
-
-var isNotNil =
-/*#__PURE__*/
-_curry1(function isNotNil(x) {
+var isNotNil = /*#__PURE__*/_curry1(function isNotNil(x) {
   return !isNil(x);
 });
-
 module.exports = isNotNil;
 
 /***/ }),
@@ -26328,9 +23036,7 @@ module.exports = isNotNil;
 /***/ 33981:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var invoker =
-/*#__PURE__*/
-__nccwpck_require__(44910);
+var invoker = /*#__PURE__*/__nccwpck_require__(44910);
 /**
  * Returns a string made by inserting the `separator` between each element and
  * concatenating all the elements into a single string.
@@ -26350,11 +23056,7 @@ __nccwpck_require__(44910);
  *      spacer(['a', 2, 3.4]);   //=> 'a 2 3.4'
  *      R.join('|', [1, 2, 3]);    //=> '1|2|3'
  */
-
-
-var join =
-/*#__PURE__*/
-invoker(1, 'join');
+var join = /*#__PURE__*/invoker(1, 'join');
 module.exports = join;
 
 /***/ }),
@@ -26362,13 +23064,8 @@ module.exports = join;
 /***/ 21897:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var converge =
-/*#__PURE__*/
-__nccwpck_require__(80810);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var converge = /*#__PURE__*/__nccwpck_require__(80810);
 /**
  * juxt applies a list of functions to a list of values.
  *
@@ -26386,16 +23083,11 @@ __nccwpck_require__(80810);
  *      getRange(3, 4, 9, -3); //=> [-3, 9]
  * @symb R.juxt([f, g, h])(a, b) = [f(a, b), g(a, b), h(a, b)]
  */
-
-
-var juxt =
-/*#__PURE__*/
-_curry1(function juxt(fns) {
+var juxt = /*#__PURE__*/_curry1(function juxt(fns) {
   return converge(function () {
     return Array.prototype.slice.call(arguments, 0);
   }, fns);
 });
-
 module.exports = juxt;
 
 /***/ }),
@@ -26403,47 +23095,30 @@ module.exports = juxt;
 /***/ 96755:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var _has =
-/*#__PURE__*/
-__nccwpck_require__(41693);
-
-var _isArguments =
-/*#__PURE__*/
-__nccwpck_require__(8989); // cover IE < 9 keys issues
-
-
-var hasEnumBug = !
-/*#__PURE__*/
-{
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _has = /*#__PURE__*/__nccwpck_require__(41693);
+var _isArguments = /*#__PURE__*/__nccwpck_require__(8989); // cover IE < 9 keys issues
+var hasEnumBug = ! /*#__PURE__*/{
   toString: null
 }.propertyIsEnumerable('toString');
-var nonEnumerableProps = ['constructor', 'valueOf', 'isPrototypeOf', 'toString', 'propertyIsEnumerable', 'hasOwnProperty', 'toLocaleString']; // Safari bug
-
-var hasArgsEnumBug =
-/*#__PURE__*/
-function () {
+var nonEnumerableProps = ['constructor', 'valueOf', 'isPrototypeOf', 'toString', 'propertyIsEnumerable', 'hasOwnProperty', 'toLocaleString'];
+// Safari bug
+var hasArgsEnumBug = /*#__PURE__*/function () {
   'use strict';
 
   return arguments.propertyIsEnumerable('length');
 }();
-
 var contains = function contains(list, item) {
   var idx = 0;
-
   while (idx < list.length) {
     if (list[idx] === item) {
       return true;
     }
-
     idx += 1;
   }
-
   return false;
 };
+
 /**
  * Returns a list containing the names of all the enumerable own properties of
  * the supplied object.
@@ -26462,44 +23137,30 @@ var contains = function contains(list, item) {
  *
  *      R.keys({a: 1, b: 2, c: 3}); //=> ['a', 'b', 'c']
  */
-
-
-var keys = typeof Object.keys === 'function' && !hasArgsEnumBug ?
-/*#__PURE__*/
-_curry1(function keys(obj) {
+var keys = typeof Object.keys === 'function' && !hasArgsEnumBug ? /*#__PURE__*/_curry1(function keys(obj) {
   return Object(obj) !== obj ? [] : Object.keys(obj);
-}) :
-/*#__PURE__*/
-_curry1(function keys(obj) {
+}) : /*#__PURE__*/_curry1(function keys(obj) {
   if (Object(obj) !== obj) {
     return [];
   }
-
   var prop, nIdx;
   var ks = [];
-
   var checkArgsLength = hasArgsEnumBug && _isArguments(obj);
-
   for (prop in obj) {
     if (_has(prop, obj) && (!checkArgsLength || prop !== 'length')) {
       ks[ks.length] = prop;
     }
   }
-
   if (hasEnumBug) {
     nIdx = nonEnumerableProps.length - 1;
-
     while (nIdx >= 0) {
       prop = nonEnumerableProps[nIdx];
-
       if (_has(prop, obj) && !contains(ks, prop)) {
         ks[ks.length] = prop;
       }
-
       nIdx -= 1;
     }
   }
-
   return ks;
 });
 module.exports = keys;
@@ -26509,9 +23170,7 @@ module.exports = keys;
 /***/ 21464:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Returns a list containing the names of all the properties of the supplied
  * object, including prototype properties.
@@ -26533,21 +23192,14 @@ __nccwpck_require__(60713);
  *      const f = new F();
  *      R.keysIn(f); //=> ['x', 'y']
  */
-
-
-var keysIn =
-/*#__PURE__*/
-_curry1(function keysIn(obj) {
+var keysIn = /*#__PURE__*/_curry1(function keysIn(obj) {
   var prop;
   var ks = [];
-
   for (prop in obj) {
     ks[ks.length] = prop;
   }
-
   return ks;
 });
-
 module.exports = keysIn;
 
 /***/ }),
@@ -26555,9 +23207,8 @@ module.exports = keysIn;
 /***/ 83855:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var nth =
-/*#__PURE__*/
-__nccwpck_require__(87280);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _nth = /*#__PURE__*/__nccwpck_require__(88303);
 /**
  * Returns the last element of the given list or string.
  *
@@ -26566,7 +23217,7 @@ __nccwpck_require__(87280);
  * @since v0.1.4
  * @category List
  * @sig [a] -> a | Undefined
- * @sig String -> String
+ * @sig String -> String | Undefined
  * @param {*} list
  * @return {*}
  * @see R.init, R.head, R.tail
@@ -26576,13 +23227,11 @@ __nccwpck_require__(87280);
  *      R.last([]); //=> undefined
  *
  *      R.last('abc'); //=> 'c'
- *      R.last(''); //=> ''
+ *      R.last(''); //=> undefined
  */
-
-
-var last =
-/*#__PURE__*/
-nth(-1);
+var last = /*#__PURE__*/_curry1(function (list) {
+  return _nth(-1, list);
+});
 module.exports = last;
 
 /***/ }),
@@ -26590,17 +23239,9 @@ module.exports = last;
 /***/ 88054:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _isArray =
-/*#__PURE__*/
-__nccwpck_require__(56999);
-
-var equals =
-/*#__PURE__*/
-__nccwpck_require__(50548);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _isArray = /*#__PURE__*/__nccwpck_require__(56999);
+var equals = /*#__PURE__*/__nccwpck_require__(50548);
 /**
  * Returns the position of the last occurrence of an item in an array, or -1 if
  * the item is not included in the array. [`R.equals`](#equals) is used to
@@ -26620,28 +23261,20 @@ __nccwpck_require__(50548);
  *      R.lastIndexOf(3, [-1,3,3,0,1,2,3,4]); //=> 6
  *      R.lastIndexOf(10, [1,2,3,4]); //=> -1
  */
-
-
-var lastIndexOf =
-/*#__PURE__*/
-_curry2(function lastIndexOf(target, xs) {
+var lastIndexOf = /*#__PURE__*/_curry2(function lastIndexOf(target, xs) {
   if (typeof xs.lastIndexOf === 'function' && !_isArray(xs)) {
     return xs.lastIndexOf(target);
   } else {
     var idx = xs.length - 1;
-
     while (idx >= 0) {
       if (equals(xs[idx], target)) {
         return idx;
       }
-
       idx -= 1;
     }
-
     return -1;
   }
 });
-
 module.exports = lastIndexOf;
 
 /***/ }),
@@ -26649,13 +23282,8 @@ module.exports = lastIndexOf;
 /***/ 30819:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var _isNumber =
-/*#__PURE__*/
-__nccwpck_require__(47573);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _isNumber = /*#__PURE__*/__nccwpck_require__(47573);
 /**
  * Returns the number of elements in the array by returning `list.length`.
  *
@@ -26671,14 +23299,9 @@ __nccwpck_require__(47573);
  *      R.length([]); //=> 0
  *      R.length([1, 2, 3]); //=> 3
  */
-
-
-var length =
-/*#__PURE__*/
-_curry1(function length(list) {
+var length = /*#__PURE__*/_curry1(function length(list) {
   return list != null && _isNumber(list.length) ? list.length : NaN;
 });
-
 module.exports = length;
 
 /***/ }),
@@ -26686,13 +23309,8 @@ module.exports = length;
 /***/ 83076:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var map =
-/*#__PURE__*/
-__nccwpck_require__(28820);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var map = /*#__PURE__*/__nccwpck_require__(28820);
 /**
  * Returns a lens for the given getter and setter functions. The getter "gets"
  * the value of the focus; the setter "sets" the value of the focus. The setter
@@ -26716,11 +23334,7 @@ __nccwpck_require__(28820);
  *      R.set(xLens, 4, {x: 1, y: 2});          //=> {x: 4, y: 2}
  *      R.over(xLens, R.negate, {x: 1, y: 2});  //=> {x: -1, y: 2}
  */
-
-
-var lens =
-/*#__PURE__*/
-_curry2(function lens(getter, setter) {
+var lens = /*#__PURE__*/_curry2(function lens(getter, setter) {
   return function (toFunctorFn) {
     return function (target) {
       return map(function (focus) {
@@ -26729,7 +23343,6 @@ _curry2(function lens(getter, setter) {
     };
   };
 });
-
 module.exports = lens;
 
 /***/ }),
@@ -26737,21 +23350,10 @@ module.exports = lens;
 /***/ 92757:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var lens =
-/*#__PURE__*/
-__nccwpck_require__(83076);
-
-var nth =
-/*#__PURE__*/
-__nccwpck_require__(87280);
-
-var update =
-/*#__PURE__*/
-__nccwpck_require__(70129);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _nth = /*#__PURE__*/__nccwpck_require__(88303);
+var lens = /*#__PURE__*/__nccwpck_require__(83076);
+var update = /*#__PURE__*/__nccwpck_require__(70129);
 /**
  * Returns a lens whose focus is the specified index.
  *
@@ -26772,14 +23374,11 @@ __nccwpck_require__(70129);
  *      R.set(headLens, 'x', ['a', 'b', 'c']);        //=> ['x', 'b', 'c']
  *      R.over(headLens, R.toUpper, ['a', 'b', 'c']); //=> ['A', 'b', 'c']
  */
-
-
-var lensIndex =
-/*#__PURE__*/
-_curry1(function lensIndex(n) {
-  return lens(nth(n), update(n));
+var lensIndex = /*#__PURE__*/_curry1(function lensIndex(n) {
+  return lens(function (val) {
+    return _nth(n, val);
+  }, update(n));
 });
-
 module.exports = lensIndex;
 
 /***/ }),
@@ -26787,21 +23386,10 @@ module.exports = lensIndex;
 /***/ 84540:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var assocPath =
-/*#__PURE__*/
-__nccwpck_require__(89947);
-
-var lens =
-/*#__PURE__*/
-__nccwpck_require__(83076);
-
-var path =
-/*#__PURE__*/
-__nccwpck_require__(22767);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var assocPath = /*#__PURE__*/__nccwpck_require__(89947);
+var lens = /*#__PURE__*/__nccwpck_require__(83076);
+var _path = /*#__PURE__*/__nccwpck_require__(57538);
 /**
  * Returns a lens whose focus is the specified path.
  *
@@ -26826,14 +23414,11 @@ __nccwpck_require__(22767);
  *      R.over(xHeadYLens, R.negate, {x: [{y: 2, z: 3}, {y: 4, z: 5}]});
  *      //=> {x: [{y: -2, z: 3}, {y: 4, z: 5}]}
  */
-
-
-var lensPath =
-/*#__PURE__*/
-_curry1(function lensPath(p) {
-  return lens(path(p), assocPath(p));
+var lensPath = /*#__PURE__*/_curry1(function lensPath(p) {
+  return lens(function (val) {
+    return _path(p, val);
+  }, assocPath(p));
 });
-
 module.exports = lensPath;
 
 /***/ }),
@@ -26841,21 +23426,10 @@ module.exports = lensPath;
 /***/ 83704:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var assoc =
-/*#__PURE__*/
-__nccwpck_require__(93295);
-
-var lens =
-/*#__PURE__*/
-__nccwpck_require__(83076);
-
-var prop =
-/*#__PURE__*/
-__nccwpck_require__(32135);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var assoc = /*#__PURE__*/__nccwpck_require__(93295);
+var lens = /*#__PURE__*/__nccwpck_require__(83076);
+var prop = /*#__PURE__*/__nccwpck_require__(32135);
 /**
  * Returns a lens whose focus is the specified property.
  *
@@ -26876,14 +23450,9 @@ __nccwpck_require__(32135);
  *      R.set(xLens, 4, {x: 1, y: 2});          //=> {x: 4, y: 2}
  *      R.over(xLens, R.negate, {x: 1, y: 2});  //=> {x: -1, y: 2}
  */
-
-
-var lensProp =
-/*#__PURE__*/
-_curry1(function lensProp(k) {
+var lensProp = /*#__PURE__*/_curry1(function lensProp(k) {
   return lens(prop(k), assoc(k));
 });
-
 module.exports = lensProp;
 
 /***/ }),
@@ -26891,13 +23460,8 @@ module.exports = lensProp;
 /***/ 53934:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var liftN =
-/*#__PURE__*/
-__nccwpck_require__(43833);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var liftN = /*#__PURE__*/__nccwpck_require__(43833);
 /**
  * "lifts" a function of arity >= 1 so that it may "map over" a list, Function or other
  * object that satisfies the [FantasyLand Apply spec](https://github.com/fantasyland/fantasy-land#apply).
@@ -26920,14 +23484,9 @@ __nccwpck_require__(43833);
  *
  *      madd5([10, 20], [1], [2, 3], [4], [100, 200]); //=> [117, 217, 118, 218, 127, 227, 128, 228]
  */
-
-
-var lift =
-/*#__PURE__*/
-_curry1(function lift(fn) {
+var lift = /*#__PURE__*/_curry1(function lift(fn) {
   return liftN(fn.length, fn);
 });
-
 module.exports = lift;
 
 /***/ }),
@@ -26935,25 +23494,11 @@ module.exports = lift;
 /***/ 43833:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _arrayReduce =
-/*#__PURE__*/
-__nccwpck_require__(70374);
-
-var ap =
-/*#__PURE__*/
-__nccwpck_require__(32857);
-
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
-
-var map =
-/*#__PURE__*/
-__nccwpck_require__(28820);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _arrayReduce = /*#__PURE__*/__nccwpck_require__(70374);
+var ap = /*#__PURE__*/__nccwpck_require__(32857);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
+var map = /*#__PURE__*/__nccwpck_require__(28820);
 /**
  * "lifts" a function to be the specified arity, so that it may "map over" that
  * many lists, Functions or other objects that satisfy the [FantasyLand Apply spec](https://github.com/fantasyland/fantasy-land#apply).
@@ -26971,17 +23516,12 @@ __nccwpck_require__(28820);
  *      const madd3 = R.liftN(3, (...args) => R.sum(args));
  *      madd3([1,2,3], [1,2,3], [1]); //=> [3, 4, 5, 4, 5, 6, 5, 6, 7]
  */
-
-
-var liftN =
-/*#__PURE__*/
-_curry2(function liftN(arity, fn) {
+var liftN = /*#__PURE__*/_curry2(function liftN(arity, fn) {
   var lifted = curryN(arity, fn);
   return curryN(arity, function () {
     return _arrayReduce(ap, map(lifted, arguments[0]), Array.prototype.slice.call(arguments, 1));
   });
 });
-
 module.exports = liftN;
 
 /***/ }),
@@ -26989,9 +23529,7 @@ module.exports = liftN;
 /***/ 82342:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Returns `true` if the first argument is less than the second; `false`
  * otherwise.
@@ -27013,14 +23551,9 @@ __nccwpck_require__(69483);
  *      R.lt('a', 'z'); //=> true
  *      R.lt('z', 'a'); //=> false
  */
-
-
-var lt =
-/*#__PURE__*/
-_curry2(function lt(a, b) {
+var lt = /*#__PURE__*/_curry2(function lt(a, b) {
   return a < b;
 });
-
 module.exports = lt;
 
 /***/ }),
@@ -27028,9 +23561,7 @@ module.exports = lt;
 /***/ 85973:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Returns `true` if the first argument is less than or equal to the second;
  * `false` otherwise.
@@ -27052,14 +23583,9 @@ __nccwpck_require__(69483);
  *      R.lte('a', 'z'); //=> true
  *      R.lte('z', 'a'); //=> false
  */
-
-
-var lte =
-/*#__PURE__*/
-_curry2(function lte(a, b) {
+var lte = /*#__PURE__*/_curry2(function lte(a, b) {
   return a <= b;
 });
-
 module.exports = lte;
 
 /***/ }),
@@ -27067,33 +23593,13 @@ module.exports = lte;
 /***/ 28820:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _arrayReduce =
-/*#__PURE__*/
-__nccwpck_require__(70374);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _map =
-/*#__PURE__*/
-__nccwpck_require__(38077);
-
-var _xmap =
-/*#__PURE__*/
-__nccwpck_require__(58542);
-
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
-
-var keys =
-/*#__PURE__*/
-__nccwpck_require__(96755);
+var _arrayReduce = /*#__PURE__*/__nccwpck_require__(70374);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _map = /*#__PURE__*/__nccwpck_require__(38077);
+var _xmap = /*#__PURE__*/__nccwpck_require__(58542);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
+var keys = /*#__PURE__*/__nccwpck_require__(96755);
 /**
  * Takes a function and
  * a [functor](https://github.com/fantasyland/fantasy-land#functor),
@@ -27129,30 +23635,21 @@ __nccwpck_require__(96755);
  * @symb R.map(f, { x: a, y: b }) = { x: f(a), y: f(b) }
  * @symb R.map(f, functor_o) = functor_o.map(f)
  */
-
-
-var map =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable(['fantasy-land/map', 'map'], _xmap, function map(fn, functor) {
+var map = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable(['fantasy-land/map', 'map'], _xmap, function map(fn, functor) {
   switch (Object.prototype.toString.call(functor)) {
     case '[object Function]':
       return curryN(functor.length, function () {
         return fn.call(this, functor.apply(this, arguments));
       });
-
     case '[object Object]':
       return _arrayReduce(function (acc, key) {
         acc[key] = fn(functor[key]);
         return acc;
       }, {}, keys(functor));
-
     default:
       return _map(fn, functor);
   }
 }));
-
 module.exports = map;
 
 /***/ }),
@@ -27160,9 +23657,7 @@ module.exports = map;
 /***/ 33699:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * The `mapAccum` function behaves like a combination of map and reduce; it
  * applies a function to each element of a list, passing an accumulating
@@ -27197,25 +23692,18 @@ __nccwpck_require__(37597);
  *   ]
  * ]
  */
-
-
-var mapAccum =
-/*#__PURE__*/
-_curry3(function mapAccum(fn, acc, list) {
+var mapAccum = /*#__PURE__*/_curry3(function mapAccum(fn, acc, list) {
   var idx = 0;
   var len = list.length;
-  var result = [];
+  var result = Array(len);
   var tuple = [acc];
-
   while (idx < len) {
     tuple = fn(tuple[0], list[idx]);
     result[idx] = tuple[1];
     idx += 1;
   }
-
   return [tuple[0], result];
 });
-
 module.exports = mapAccum;
 
 /***/ }),
@@ -27223,9 +23711,7 @@ module.exports = mapAccum;
 /***/ 49440:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * The `mapAccumRight` function behaves like a combination of map and reduce; it
  * applies a function to each element of a list, passing an accumulating
@@ -27263,24 +23749,17 @@ __nccwpck_require__(37597);
  *   ]
  * ]
  */
-
-
-var mapAccumRight =
-/*#__PURE__*/
-_curry3(function mapAccumRight(fn, acc, list) {
+var mapAccumRight = /*#__PURE__*/_curry3(function mapAccumRight(fn, acc, list) {
   var idx = list.length - 1;
-  var result = [];
+  var result = Array(list.length);
   var tuple = [acc];
-
   while (idx >= 0) {
     tuple = fn(tuple[0], list[idx]);
     result[idx] = tuple[1];
     idx -= 1;
   }
-
   return [tuple[0], result];
 });
-
 module.exports = mapAccumRight;
 
 /***/ }),
@@ -27288,17 +23767,9 @@ module.exports = mapAccumRight;
 /***/ 71986:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _arrayReduce =
-/*#__PURE__*/
-__nccwpck_require__(70374);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var keys =
-/*#__PURE__*/
-__nccwpck_require__(96755);
+var _arrayReduce = /*#__PURE__*/__nccwpck_require__(70374);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var keys = /*#__PURE__*/__nccwpck_require__(96755);
 /**
  * An Object-specific version of [`map`](#map). The function is applied to three
  * arguments: *(value, key, obj)*. If only the value is significant, use
@@ -27320,17 +23791,12 @@ __nccwpck_require__(96755);
  *
  *      R.mapObjIndexed(prependKeyAndDouble, xyz); //=> { x: 'x2', y: 'y4', z: 'z6' }
  */
-
-
-var mapObjIndexed =
-/*#__PURE__*/
-_curry2(function mapObjIndexed(fn, obj) {
+var mapObjIndexed = /*#__PURE__*/_curry2(function mapObjIndexed(fn, obj) {
   return _arrayReduce(function (acc, key) {
     acc[key] = fn(obj[key], key, obj);
     return acc;
   }, {}, keys(obj));
 });
-
 module.exports = mapObjIndexed;
 
 /***/ }),
@@ -27338,9 +23804,7 @@ module.exports = mapObjIndexed;
 /***/ 48964:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Tests a regular expression against a String. Note that this function will
  * return an empty array when there are no matches. This differs from
@@ -27362,14 +23826,9 @@ __nccwpck_require__(69483);
  *      R.match(/a/, 'b'); //=> []
  *      R.match(/a/, null); //=> TypeError: null does not have a method named "match"
  */
-
-
-var match =
-/*#__PURE__*/
-_curry2(function match(rx, str) {
+var match = /*#__PURE__*/_curry2(function match(rx, str) {
   return str.match(rx) || [];
 });
-
 module.exports = match;
 
 /***/ }),
@@ -27377,13 +23836,8 @@ module.exports = match;
 /***/ 86733:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _isInteger =
-/*#__PURE__*/
-__nccwpck_require__(87924);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _isInteger = /*#__PURE__*/__nccwpck_require__(87924);
 /**
  * `mathMod` behaves like the modulo operator should mathematically, unlike the
  * `%` operator (and by extension, [`R.modulo`](#modulo)). So while
@@ -27417,22 +23871,15 @@ __nccwpck_require__(87924);
  *      seventeenMod(4);  //=> 1
  *      seventeenMod(10); //=> 7
  */
-
-
-var mathMod =
-/*#__PURE__*/
-_curry2(function mathMod(m, p) {
+var mathMod = /*#__PURE__*/_curry2(function mathMod(m, p) {
   if (!_isInteger(m)) {
     return NaN;
   }
-
   if (!_isInteger(p) || p < 1) {
     return NaN;
   }
-
   return (m % p + p) % p;
 });
-
 module.exports = mathMod;
 
 /***/ }),
@@ -27440,13 +23887,8 @@ module.exports = mathMod;
 /***/ 99356:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var toString =
-/*#__PURE__*/
-__nccwpck_require__(76119);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var toString = /*#__PURE__*/__nccwpck_require__(76119);
 /**
  * Returns the larger of its two arguments.
  *
@@ -27464,45 +23906,31 @@ __nccwpck_require__(76119);
  *      R.max(789, 123); //=> 789
  *      R.max('a', 'b'); //=> 'b'
  */
-
-
-var max =
-/*#__PURE__*/
-_curry2(function max(a, b) {
+var max = /*#__PURE__*/_curry2(function max(a, b) {
   if (a === b) {
     return b;
   }
-
   function safeMax(x, y) {
     if (x > y !== y > x) {
       return y > x ? y : x;
     }
-
     return undefined;
   }
-
   var maxByValue = safeMax(a, b);
-
   if (maxByValue !== undefined) {
     return maxByValue;
   }
-
   var maxByType = safeMax(typeof a, typeof b);
-
   if (maxByType !== undefined) {
     return maxByType === typeof a ? a : b;
   }
-
   var stringA = toString(a);
   var maxByStringValue = safeMax(stringA, toString(b));
-
   if (maxByStringValue !== undefined) {
     return maxByStringValue === stringA ? a : b;
   }
-
   return b;
 });
-
 module.exports = max;
 
 /***/ }),
@@ -27510,13 +23938,8 @@ module.exports = max;
 /***/ 22928:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var max =
-/*#__PURE__*/
-__nccwpck_require__(99356);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var max = /*#__PURE__*/__nccwpck_require__(99356);
 /**
  * Takes a function and two values, and returns whichever value produces the
  * larger result when passed to the provided function.
@@ -27541,15 +23964,10 @@ __nccwpck_require__(99356);
  *      R.reduce(R.maxBy(square), 0, [3, -5, 4, 1, -2]); //=> -5
  *      R.reduce(R.maxBy(square), 0, []); //=> 0
  */
-
-
-var maxBy =
-/*#__PURE__*/
-_curry3(function maxBy(f, a, b) {
+var maxBy = /*#__PURE__*/_curry3(function maxBy(f, a, b) {
   var resultB = f(b);
   return max(f(a), resultB) === resultB ? b : a;
 });
-
 module.exports = maxBy;
 
 /***/ }),
@@ -27557,13 +23975,8 @@ module.exports = maxBy;
 /***/ 67527:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var sum =
-/*#__PURE__*/
-__nccwpck_require__(14761);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var sum = /*#__PURE__*/__nccwpck_require__(14761);
 /**
  * Returns the mean of the given list of numbers.
  *
@@ -27580,14 +23993,9 @@ __nccwpck_require__(14761);
  *      R.mean([2, 7, 9]); //=> 6
  *      R.mean([]); //=> NaN
  */
-
-
-var mean =
-/*#__PURE__*/
-_curry1(function mean(list) {
+var mean = /*#__PURE__*/_curry1(function mean(list) {
   return sum(list) / list.length;
 });
-
 module.exports = mean;
 
 /***/ }),
@@ -27595,13 +24003,8 @@ module.exports = mean;
 /***/ 83966:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var mean =
-/*#__PURE__*/
-__nccwpck_require__(67527);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var mean = /*#__PURE__*/__nccwpck_require__(67527);
 /**
  * Returns the median of the given list of numbers.
  *
@@ -27619,24 +24022,17 @@ __nccwpck_require__(67527);
  *      R.median([7, 2, 10, 9]); //=> 8
  *      R.median([]); //=> NaN
  */
-
-
-var median =
-/*#__PURE__*/
-_curry1(function median(list) {
+var median = /*#__PURE__*/_curry1(function median(list) {
   var len = list.length;
-
   if (len === 0) {
     return NaN;
   }
-
   var width = 2 - len % 2;
   var idx = (len - width) / 2;
   return mean(Array.prototype.slice.call(list, 0).sort(function (a, b) {
     return a < b ? -1 : a > b ? 1 : 0;
   }).slice(idx, idx + width));
 });
-
 module.exports = median;
 
 /***/ }),
@@ -27644,17 +24040,9 @@ module.exports = median;
 /***/ 42454:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _arity =
-/*#__PURE__*/
-__nccwpck_require__(31414);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _has =
-/*#__PURE__*/
-__nccwpck_require__(41693);
+var _arity = /*#__PURE__*/__nccwpck_require__(31414);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _has = /*#__PURE__*/__nccwpck_require__(41693);
 /**
  * Takes a string-returning function `keyGen` and a function `fn` and returns
  * a new function that returns cached results for subsequent
@@ -27693,23 +24081,16 @@ __nccwpck_require__(41693);
  *      withAge({birth: 1921, death: 1999});
  *      //=> {birth: 1921, death: 1999, age: 78} (returned from cache)
  */
-
-
-var memoizeWith =
-/*#__PURE__*/
-_curry2(function memoizeWith(keyGen, fn) {
+var memoizeWith = /*#__PURE__*/_curry2(function memoizeWith(keyGen, fn) {
   var cache = {};
   return _arity(fn.length, function () {
     var key = keyGen.apply(this, arguments);
-
     if (!_has(key, cache)) {
       cache[key] = fn.apply(this, arguments);
     }
-
     return cache[key];
   });
 });
-
 module.exports = memoizeWith;
 
 /***/ }),
@@ -27717,13 +24098,8 @@ module.exports = memoizeWith;
 /***/ 3616:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _objectAssign =
-/*#__PURE__*/
-__nccwpck_require__(95291);
-
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var _objectAssign = /*#__PURE__*/__nccwpck_require__(95291);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Creates one new object with the own properties from a list of objects.
  * If a key exists in more than one object, the value from the last
@@ -27743,14 +24119,9 @@ __nccwpck_require__(60713);
  *      R.mergeAll([{foo:1},{foo:2},{bar:2}]); //=> {foo:2,bar:2}
  * @symb R.mergeAll([{ x: 1 }, { y: 2 }, { z: 3 }]) = { x: 1, y: 2, z: 3 }
  */
-
-
-var mergeAll =
-/*#__PURE__*/
-_curry1(function mergeAll(list) {
+var mergeAll = /*#__PURE__*/_curry1(function mergeAll(list) {
   return _objectAssign.apply(null, [{}].concat(list));
 });
-
 module.exports = mergeAll;
 
 /***/ }),
@@ -27758,13 +24129,8 @@ module.exports = mergeAll;
 /***/ 96707:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var mergeDeepWithKey =
-/*#__PURE__*/
-__nccwpck_require__(69500);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var mergeDeepWithKey = /*#__PURE__*/__nccwpck_require__(69500);
 /**
  * Creates a new object with the own properties of the first object merged with
  * the own properties of the second object. If a key exists in both objects:
@@ -27786,16 +24152,11 @@ __nccwpck_require__(69500);
  *                      { age: 40, contact: { email: 'baa@example.com' }});
  *      //=> { name: 'fred', age: 10, contact: { email: 'moo@example.com' }}
  */
-
-
-var mergeDeepLeft =
-/*#__PURE__*/
-_curry2(function mergeDeepLeft(lObj, rObj) {
+var mergeDeepLeft = /*#__PURE__*/_curry2(function mergeDeepLeft(lObj, rObj) {
   return mergeDeepWithKey(function (k, lVal, rVal) {
     return lVal;
   }, lObj, rObj);
 });
-
 module.exports = mergeDeepLeft;
 
 /***/ }),
@@ -27803,13 +24164,8 @@ module.exports = mergeDeepLeft;
 /***/ 39277:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var mergeDeepWithKey =
-/*#__PURE__*/
-__nccwpck_require__(69500);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var mergeDeepWithKey = /*#__PURE__*/__nccwpck_require__(69500);
 /**
  * Creates a new object with the own properties of the first object merged with
  * the own properties of the second object. If a key exists in both objects:
@@ -27831,16 +24187,11 @@ __nccwpck_require__(69500);
  *                       { age: 40, contact: { email: 'baa@example.com' }});
  *      //=> { name: 'fred', age: 40, contact: { email: 'baa@example.com' }}
  */
-
-
-var mergeDeepRight =
-/*#__PURE__*/
-_curry2(function mergeDeepRight(lObj, rObj) {
+var mergeDeepRight = /*#__PURE__*/_curry2(function mergeDeepRight(lObj, rObj) {
   return mergeDeepWithKey(function (k, lVal, rVal) {
     return rVal;
   }, lObj, rObj);
 });
-
 module.exports = mergeDeepRight;
 
 /***/ }),
@@ -27848,13 +24199,8 @@ module.exports = mergeDeepRight;
 /***/ 3007:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var mergeDeepWithKey =
-/*#__PURE__*/
-__nccwpck_require__(69500);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var mergeDeepWithKey = /*#__PURE__*/__nccwpck_require__(69500);
 /**
  * Creates a new object with the own properties of the two provided objects.
  * If a key exists in both objects:
@@ -27882,16 +24228,11 @@ __nccwpck_require__(69500);
  *                      { b: true, c: { values: [15, 35] }});
  *      //=> { a: true, b: true, c: { values: [10, 20, 15, 35] }}
  */
-
-
-var mergeDeepWith =
-/*#__PURE__*/
-_curry3(function mergeDeepWith(fn, lObj, rObj) {
+var mergeDeepWith = /*#__PURE__*/_curry3(function mergeDeepWith(fn, lObj, rObj) {
   return mergeDeepWithKey(function (k, lVal, rVal) {
     return fn(lVal, rVal);
   }, lObj, rObj);
 });
-
 module.exports = mergeDeepWith;
 
 /***/ }),
@@ -27899,17 +24240,9 @@ module.exports = mergeDeepWith;
 /***/ 69500:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var _isObject =
-/*#__PURE__*/
-__nccwpck_require__(80774);
-
-var mergeWithKey =
-/*#__PURE__*/
-__nccwpck_require__(3206);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var _isObject = /*#__PURE__*/__nccwpck_require__(80774);
+var mergeWithKey = /*#__PURE__*/__nccwpck_require__(3206);
 /**
  * Creates a new object with the own properties of the two provided objects.
  * If a key exists in both objects:
@@ -27938,11 +24271,7 @@ __nccwpck_require__(3206);
  *                         { b: true, c: { thing: 'bar', values: [15, 35] }});
  *      //=> { a: true, b: true, c: { thing: 'bar', values: [10, 20, 15, 35] }}
  */
-
-
-var mergeDeepWithKey =
-/*#__PURE__*/
-_curry3(function mergeDeepWithKey(fn, lObj, rObj) {
+var mergeDeepWithKey = /*#__PURE__*/_curry3(function mergeDeepWithKey(fn, lObj, rObj) {
   return mergeWithKey(function (k, lVal, rVal) {
     if (_isObject(lVal) && _isObject(rVal)) {
       return mergeDeepWithKey(fn, lVal, rVal);
@@ -27951,7 +24280,6 @@ _curry3(function mergeDeepWithKey(fn, lObj, rObj) {
     }
   }, lObj, rObj);
 });
-
 module.exports = mergeDeepWithKey;
 
 /***/ }),
@@ -27959,13 +24287,8 @@ module.exports = mergeDeepWithKey;
 /***/ 33970:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _objectAssign =
-/*#__PURE__*/
-__nccwpck_require__(95291);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _objectAssign = /*#__PURE__*/__nccwpck_require__(95291);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Create a new object with the own properties of the first object merged with
  * the own properties of the second object. If a key exists in both objects,
@@ -27989,14 +24312,9 @@ __nccwpck_require__(69483);
  *      resetToDefault({x: 5, y: 2}); //=> {x: 0, y: 2}
  * @symb R.mergeLeft(a, b) = {...b, ...a}
  */
-
-
-var mergeLeft =
-/*#__PURE__*/
-_curry2(function mergeLeft(l, r) {
+var mergeLeft = /*#__PURE__*/_curry2(function mergeLeft(l, r) {
   return _objectAssign({}, r, l);
 });
-
 module.exports = mergeLeft;
 
 /***/ }),
@@ -28004,13 +24322,8 @@ module.exports = mergeLeft;
 /***/ 3004:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _objectAssign =
-/*#__PURE__*/
-__nccwpck_require__(95291);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _objectAssign = /*#__PURE__*/__nccwpck_require__(95291);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Create a new object with the own properties of the first object merged with
  * the own properties of the second object. If a key exists in both objects,
@@ -28034,14 +24347,9 @@ __nccwpck_require__(69483);
  *      withDefaults({y: 2}); //=> {x: 0, y: 2}
  * @symb R.mergeRight(a, b) = {...a, ...b}
  */
-
-
-var mergeRight =
-/*#__PURE__*/
-_curry2(function mergeRight(l, r) {
+var mergeRight = /*#__PURE__*/_curry2(function mergeRight(l, r) {
   return _objectAssign({}, l, r);
 });
-
 module.exports = mergeRight;
 
 /***/ }),
@@ -28049,13 +24357,8 @@ module.exports = mergeRight;
 /***/ 65661:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var mergeWithKey =
-/*#__PURE__*/
-__nccwpck_require__(3206);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var mergeWithKey = /*#__PURE__*/__nccwpck_require__(3206);
 /**
  * Creates a new object with the own properties of the two provided objects. If
  * a key exists in both objects, the provided function is applied to the values
@@ -28079,16 +24382,11 @@ __nccwpck_require__(3206);
  *                  { b: true, values: [15, 35] });
  *      //=> { a: true, b: true, values: [10, 20, 15, 35] }
  */
-
-
-var mergeWith =
-/*#__PURE__*/
-_curry3(function mergeWith(fn, l, r) {
+var mergeWith = /*#__PURE__*/_curry3(function mergeWith(fn, l, r) {
   return mergeWithKey(function (_, _l, _r) {
     return fn(_l, _r);
   }, l, r);
 });
-
 module.exports = mergeWith;
 
 /***/ }),
@@ -28096,13 +24394,8 @@ module.exports = mergeWith;
 /***/ 3206:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var _has =
-/*#__PURE__*/
-__nccwpck_require__(41693);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var _has = /*#__PURE__*/__nccwpck_require__(41693);
 /**
  * Creates a new object with the own properties of the two provided objects. If
  * a key exists in both objects, the provided function is applied to the key
@@ -28128,31 +24421,23 @@ __nccwpck_require__(41693);
  *      //=> { a: true, b: true, thing: 'bar', values: [10, 20, 15, 35] }
  * @symb R.mergeWithKey(f, { x: 1, y: 2 }, { y: 5, z: 3 }) = { x: 1, y: f('y', 2, 5), z: 3 }
  */
-
-
-var mergeWithKey =
-/*#__PURE__*/
-_curry3(function mergeWithKey(fn, l, r) {
+var mergeWithKey = /*#__PURE__*/_curry3(function mergeWithKey(fn, l, r) {
   var result = {};
   var k;
   l = l || {};
   r = r || {};
-
   for (k in l) {
     if (_has(k, l)) {
       result[k] = _has(k, r) ? fn(k, l[k], r[k]) : l[k];
     }
   }
-
   for (k in r) {
     if (_has(k, r) && !_has(k, result)) {
       result[k] = r[k];
     }
   }
-
   return result;
 });
-
 module.exports = mergeWithKey;
 
 /***/ }),
@@ -28160,13 +24445,8 @@ module.exports = mergeWithKey;
 /***/ 3229:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var toString =
-/*#__PURE__*/
-__nccwpck_require__(76119);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var toString = /*#__PURE__*/__nccwpck_require__(76119);
 /**
  * Returns the smaller of its two arguments.
  *
@@ -28184,45 +24464,31 @@ __nccwpck_require__(76119);
  *      R.min(789, 123); //=> 123
  *      R.min('a', 'b'); //=> 'a'
  */
-
-
-var min =
-/*#__PURE__*/
-_curry2(function min(a, b) {
+var min = /*#__PURE__*/_curry2(function min(a, b) {
   if (a === b) {
     return a;
   }
-
   function safeMin(x, y) {
     if (x < y !== y < x) {
       return y < x ? y : x;
     }
-
     return undefined;
   }
-
   var minByValue = safeMin(a, b);
-
   if (minByValue !== undefined) {
     return minByValue;
   }
-
   var minByType = safeMin(typeof a, typeof b);
-
   if (minByType !== undefined) {
     return minByType === typeof a ? a : b;
   }
-
   var stringA = toString(a);
   var minByStringValue = safeMin(stringA, toString(b));
-
   if (minByStringValue !== undefined) {
     return minByStringValue === stringA ? a : b;
   }
-
   return a;
 });
-
 module.exports = min;
 
 /***/ }),
@@ -28230,13 +24496,8 @@ module.exports = min;
 /***/ 20154:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var min =
-/*#__PURE__*/
-__nccwpck_require__(3229);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var min = /*#__PURE__*/__nccwpck_require__(3229);
 /**
  * Takes a function and two values, and returns whichever value produces the
  * smaller result when passed to the provided function.
@@ -28261,15 +24522,10 @@ __nccwpck_require__(3229);
  *      R.reduce(R.minBy(square), Infinity, [3, -5, 4, 1, -2]); //=> 1
  *      R.reduce(R.minBy(square), Infinity, []); //=> Infinity
  */
-
-
-var minBy =
-/*#__PURE__*/
-_curry3(function minBy(f, a, b) {
+var minBy = /*#__PURE__*/_curry3(function minBy(f, a, b) {
   var resultB = f(b);
   return min(f(a), resultB) === resultB ? b : a;
 });
-
 module.exports = minBy;
 
 /***/ }),
@@ -28277,13 +24533,8 @@ module.exports = minBy;
 /***/ 92720:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var modifyPath =
-/*#__PURE__*/
-__nccwpck_require__(20478);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var modifyPath = /*#__PURE__*/__nccwpck_require__(20478);
 /**
  * Creates a copy of the passed object by applying an `fn` function to the given `prop` property.
  *
@@ -28306,14 +24557,9 @@ __nccwpck_require__(20478);
  *      R.modify('age', R.add(1), person); //=> {name: 'James', age: 21, pets: ['dog', 'cat']}
  *      R.modify('pets', R.append('turtle'), person); //=> {name: 'James', age: 20, pets: ['dog', 'cat', 'turtle']}
  */
-
-
-var modify =
-/*#__PURE__*/
-_curry3(function modify(prop, fn, object) {
+var modify = /*#__PURE__*/_curry3(function modify(prop, fn, object) {
   return modifyPath([prop], fn, object);
 });
-
 module.exports = modify;
 
 /***/ }),
@@ -28321,29 +24567,12 @@ module.exports = modify;
 /***/ 20478:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var _isArray =
-/*#__PURE__*/
-__nccwpck_require__(56999);
-
-var _isObject =
-/*#__PURE__*/
-__nccwpck_require__(80774);
-
-var _has =
-/*#__PURE__*/
-__nccwpck_require__(41693);
-
-var _assoc =
-/*#__PURE__*/
-__nccwpck_require__(84702);
-
-var _modify =
-/*#__PURE__*/
-__nccwpck_require__(9245);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var _isArray = /*#__PURE__*/__nccwpck_require__(56999);
+var _isObject = /*#__PURE__*/__nccwpck_require__(80774);
+var _has = /*#__PURE__*/__nccwpck_require__(41693);
+var _assoc = /*#__PURE__*/__nccwpck_require__(84702);
+var _modify = /*#__PURE__*/__nccwpck_require__(9245);
 /**
  * Creates a shallow clone of the passed object by applying an `fn` function
  * to the value at the given path.
@@ -28370,38 +24599,26 @@ __nccwpck_require__(9245);
  *      const person = {name: 'James', addresses: [{ zipCode: '90216' }]};
  *      R.modifyPath(['addresses', 0, 'zipCode'], R.reverse, person); //=> {name: 'James', addresses: [{ zipCode: '61209' }]}
  */
-
-
-var modifyPath =
-/*#__PURE__*/
-_curry3(function modifyPath(path, fn, object) {
+var modifyPath = /*#__PURE__*/_curry3(function modifyPath(path, fn, object) {
   if (!_isObject(object) && !_isArray(object)) {
     return object;
   }
-
   if (path.length === 0) {
     return fn(object);
   }
-
   var idx = path[0];
-
   if (!_has(idx, object)) {
     return object;
   }
-
   if (path.length === 1) {
     return _modify(idx, fn, object);
   }
-
   var val = modifyPath(Array.prototype.slice.call(path, 1), fn, object[idx]);
-
   if (val === object[idx]) {
     return object;
   }
-
   return _assoc(idx, val, object);
 });
-
 module.exports = modifyPath;
 
 /***/ }),
@@ -28409,9 +24626,7 @@ module.exports = modifyPath;
 /***/ 33386:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Divides the first parameter by the second and returns the remainder. Note
  * that this function preserves the JavaScript-style behavior for modulo. For
@@ -28437,14 +24652,9 @@ __nccwpck_require__(69483);
  *      isOdd(42); //=> 0
  *      isOdd(21); //=> 1
  */
-
-
-var modulo =
-/*#__PURE__*/
-_curry2(function modulo(a, b) {
+var modulo = /*#__PURE__*/_curry2(function modulo(a, b) {
   return a % b;
 });
-
 module.exports = modulo;
 
 /***/ }),
@@ -28452,9 +24662,7 @@ module.exports = modulo;
 /***/ 78801:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * Move an item, at index `from`, to index `to`, in a list of elements.
  * A new list will be created containing the new elements order.
@@ -28473,11 +24681,7 @@ __nccwpck_require__(37597);
  *      R.move(0, 2, ['a', 'b', 'c', 'd', 'e', 'f']); //=> ['b', 'c', 'a', 'd', 'e', 'f']
  *      R.move(-1, 0, ['a', 'b', 'c', 'd', 'e', 'f']); //=> ['f', 'a', 'b', 'c', 'd', 'e'] list rotation
  */
-
-
-var move =
-/*#__PURE__*/
-_curry3(function (from, to, list) {
+var move = /*#__PURE__*/_curry3(function (from, to, list) {
   var length = list.length;
   var result = list.slice();
   var positiveFrom = from < 0 ? length + from : from;
@@ -28485,7 +24689,6 @@ _curry3(function (from, to, list) {
   var item = result.splice(positiveFrom, 1);
   return positiveFrom < 0 || positiveFrom >= list.length || positiveTo < 0 || positiveTo >= list.length ? list : [].concat(result.slice(0, positiveTo)).concat(item).concat(result.slice(positiveTo, list.length));
 });
-
 module.exports = move;
 
 /***/ }),
@@ -28493,9 +24696,7 @@ module.exports = move;
 /***/ 3858:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Multiplies two numbers. Equivalent to `a * b` but curried.
  *
@@ -28516,14 +24717,9 @@ __nccwpck_require__(69483);
  *      triple(4);       //=> 12
  *      R.multiply(2, 5);  //=> 10
  */
-
-
-var multiply =
-/*#__PURE__*/
-_curry2(function multiply(a, b) {
+var multiply = /*#__PURE__*/_curry2(function multiply(a, b) {
   return a * b;
 });
-
 module.exports = multiply;
 
 /***/ }),
@@ -28531,9 +24727,7 @@ module.exports = multiply;
 /***/ 82843:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Wraps a function of any arity (including nullary) in a function that accepts
  * exactly `n` parameters. Any extraneous parameters will not be passed to the
@@ -28564,72 +24758,56 @@ __nccwpck_require__(69483);
  * @symb R.nAry(1, f)(a, b) = f(a)
  * @symb R.nAry(2, f)(a, b) = f(a, b)
  */
-
-
-var nAry =
-/*#__PURE__*/
-_curry2(function nAry(n, fn) {
+var nAry = /*#__PURE__*/_curry2(function nAry(n, fn) {
   switch (n) {
     case 0:
       return function () {
         return fn.call(this);
       };
-
     case 1:
       return function (a0) {
         return fn.call(this, a0);
       };
-
     case 2:
       return function (a0, a1) {
         return fn.call(this, a0, a1);
       };
-
     case 3:
       return function (a0, a1, a2) {
         return fn.call(this, a0, a1, a2);
       };
-
     case 4:
       return function (a0, a1, a2, a3) {
         return fn.call(this, a0, a1, a2, a3);
       };
-
     case 5:
       return function (a0, a1, a2, a3, a4) {
         return fn.call(this, a0, a1, a2, a3, a4);
       };
-
     case 6:
       return function (a0, a1, a2, a3, a4, a5) {
         return fn.call(this, a0, a1, a2, a3, a4, a5);
       };
-
     case 7:
       return function (a0, a1, a2, a3, a4, a5, a6) {
         return fn.call(this, a0, a1, a2, a3, a4, a5, a6);
       };
-
     case 8:
       return function (a0, a1, a2, a3, a4, a5, a6, a7) {
         return fn.call(this, a0, a1, a2, a3, a4, a5, a6, a7);
       };
-
     case 9:
       return function (a0, a1, a2, a3, a4, a5, a6, a7, a8) {
         return fn.call(this, a0, a1, a2, a3, a4, a5, a6, a7, a8);
       };
-
     case 10:
       return function (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9) {
         return fn.call(this, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9);
       };
-
     default:
       throw new Error('First argument to nAry must be a non-negative integer no greater than ten');
   }
 });
-
 module.exports = nAry;
 
 /***/ }),
@@ -28637,9 +24815,7 @@ module.exports = nAry;
 /***/ 25905:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Negates its argument.
  *
@@ -28654,14 +24830,9 @@ __nccwpck_require__(60713);
  *
  *      R.negate(42); //=> -42
  */
-
-
-var negate =
-/*#__PURE__*/
-_curry1(function negate(n) {
+var negate = /*#__PURE__*/_curry1(function negate(n) {
   return -n;
 });
-
 module.exports = negate;
 
 /***/ }),
@@ -28669,17 +24840,9 @@ module.exports = negate;
 /***/ 62207:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _complement =
-/*#__PURE__*/
-__nccwpck_require__(3134);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var all =
-/*#__PURE__*/
-__nccwpck_require__(26097);
+var _complement = /*#__PURE__*/__nccwpck_require__(3134);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var all = /*#__PURE__*/__nccwpck_require__(26097);
 /**
  * Returns `true` if no elements of the list match the predicate, `false`
  * otherwise.
@@ -28705,14 +24868,9 @@ __nccwpck_require__(26097);
  *      R.none(isEven, [1, 3, 5, 7, 9, 11]); //=> true
  *      R.none(isOdd, [1, 3, 5, 7, 8, 11]); //=> false
  */
-
-
-var none =
-/*#__PURE__*/
-_curry2(function none(fn, input) {
+var none = /*#__PURE__*/_curry2(function none(fn, input) {
   return all(_complement(fn), input);
 });
-
 module.exports = none;
 
 /***/ }),
@@ -28720,9 +24878,7 @@ module.exports = none;
 /***/ 83991:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * A function that returns the `!` of its argument. It will return `true` when
  * passed false-y value, and `false` when passed a truth-y one.
@@ -28742,14 +24898,9 @@ __nccwpck_require__(60713);
  *      R.not(0); //=> true
  *      R.not(1); //=> false
  */
-
-
-var not =
-/*#__PURE__*/
-_curry1(function not(a) {
+var not = /*#__PURE__*/_curry1(function not(a) {
   return !a;
 });
-
 module.exports = not;
 
 /***/ }),
@@ -28757,13 +24908,8 @@ module.exports = not;
 /***/ 87280:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _isString =
-/*#__PURE__*/
-__nccwpck_require__(59076);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _nth = /*#__PURE__*/__nccwpck_require__(88303);
 /**
  * Returns the nth element of the given list or string. If n is negative the
  * element at index length + n is returned.
@@ -28773,7 +24919,7 @@ __nccwpck_require__(59076);
  * @since v0.1.0
  * @category List
  * @sig Number -> [a] -> a | Undefined
- * @sig Number -> String -> String
+ * @sig Number -> String -> String | Undefined
  * @param {Number} offset
  * @param {*} list
  * @return {*}
@@ -28785,20 +24931,12 @@ __nccwpck_require__(59076);
  *      R.nth(-99, list); //=> undefined
  *
  *      R.nth(2, 'abc'); //=> 'c'
- *      R.nth(3, 'abc'); //=> ''
+ *      R.nth(3, 'abc'); //=> undefined
  * @symb R.nth(-1, [a, b, c]) = c
  * @symb R.nth(0, [a, b, c]) = a
  * @symb R.nth(1, [a, b, c]) = b
  */
-
-
-var nth =
-/*#__PURE__*/
-_curry2(function nth(offset, list) {
-  var idx = offset < 0 ? list.length + offset : offset;
-  return _isString(list) ? list.charAt(idx) : list[idx];
-});
-
+var nth = /*#__PURE__*/_curry2(_nth);
 module.exports = nth;
 
 /***/ }),
@@ -28806,17 +24944,9 @@ module.exports = nth;
 /***/ 96295:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
-
-var nth =
-/*#__PURE__*/
-__nccwpck_require__(87280);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _nth = /*#__PURE__*/__nccwpck_require__(88303);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
 /**
  * Returns a function which returns its nth argument.
  *
@@ -28835,17 +24965,12 @@ __nccwpck_require__(87280);
  * @symb R.nthArg(0)(a, b, c) = a
  * @symb R.nthArg(1)(a, b, c) = b
  */
-
-
-var nthArg =
-/*#__PURE__*/
-_curry1(function nthArg(n) {
+var nthArg = /*#__PURE__*/_curry1(function nthArg(n) {
   var arity = n < 0 ? 1 : n + 1;
   return curryN(arity, function () {
-    return nth(n, arguments);
+    return _nth(n, arguments);
   });
 });
-
 module.exports = nthArg;
 
 /***/ }),
@@ -28853,9 +24978,7 @@ module.exports = nthArg;
 /***/ 6843:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * `o` is a curried composition function that returns a unary function.
  * Like [`compose`](#compose), `o` performs right-to-left function composition.
@@ -28883,14 +25006,9 @@ __nccwpck_require__(37597);
  *
  * @symb R.o(f, g, x) = f(g(x))
  */
-
-
-var o =
-/*#__PURE__*/
-_curry3(function o(f, g, x) {
+var o = /*#__PURE__*/_curry3(function o(f, g, x) {
   return f(g(x));
 });
-
 module.exports = o;
 
 /***/ }),
@@ -28898,9 +25016,7 @@ module.exports = o;
 /***/ 24572:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Creates an object containing a single key:value pair.
  *
@@ -28921,16 +25037,11 @@ __nccwpck_require__(69483);
  *      );
  *      matchPhrases(['foo', 'bar', 'baz']); //=> {must: [{match_phrase: 'foo'}, {match_phrase: 'bar'}, {match_phrase: 'baz'}]}
  */
-
-
-var objOf =
-/*#__PURE__*/
-_curry2(function objOf(key, val) {
+var objOf = /*#__PURE__*/_curry2(function objOf(key, val) {
   var obj = {};
   obj[key] = val;
   return obj;
 });
-
 module.exports = objOf;
 
 /***/ }),
@@ -28938,9 +25049,7 @@ module.exports = objOf;
 /***/ 76898:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Given a constructor and a value, returns a new instance of that constructor
  * containing the value.
@@ -28966,14 +25075,9 @@ __nccwpck_require__(69483);
  *      R.of(Array, [42]); //=> [[42]]
  *      R.of(Maybe, 42);   //=> Maybe.Just(42)
  */
-
-
-var of =
-/*#__PURE__*/
-_curry2(function of(Ctor, val) {
+var of = /*#__PURE__*/_curry2(function of(Ctor, val) {
   return typeof Ctor['fantasy-land/of'] === 'function' ? Ctor['fantasy-land/of'](val) : typeof Ctor.of === 'function' ? Ctor.of(val) : [val];
 });
-
 module.exports = of;
 
 /***/ }),
@@ -28981,9 +25085,7 @@ module.exports = of;
 /***/ 20737:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Returns a partial copy of an object omitting the keys specified.
  *
@@ -29000,30 +25102,22 @@ __nccwpck_require__(69483);
  *
  *      R.omit(['a', 'd'], {a: 1, b: 2, c: 3, d: 4}); //=> {b: 2, c: 3}
  */
-
-
-var omit =
-/*#__PURE__*/
-_curry2(function omit(names, obj) {
+var omit = /*#__PURE__*/_curry2(function omit(names, obj) {
   var result = {};
   var index = {};
   var idx = 0;
   var len = names.length;
-
   while (idx < len) {
     index[names[idx]] = 1;
     idx += 1;
   }
-
   for (var prop in obj) {
     if (!index.hasOwnProperty(prop)) {
       result[prop] = obj[prop];
     }
   }
-
   return result;
 });
-
 module.exports = omit;
 
 /***/ }),
@@ -29031,9 +25125,7 @@ module.exports = omit;
 /***/ 16618:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(14106);
+var curryN = /*#__PURE__*/__nccwpck_require__(14106);
 /**
  * Takes a binary function `f`, a unary function `g`, and two values.
  * Applies `g` to each value, then applies the result of each to `f`.
@@ -29059,11 +25151,7 @@ __nccwpck_require__(14106);
  *      containsInsensitive('o', 'FOO'); //=> true
  * @symb R.on(f, g, a, b) = f(g(a), g(b))
  */
-
-
-var on =
-/*#__PURE__*/
-curryN(4, [], function on(f, g, a, b) {
+var on = /*#__PURE__*/curryN(4, [], function on(f, g, a, b) {
   return f(g(a), g(b));
 });
 module.exports = on;
@@ -29073,13 +25161,8 @@ module.exports = on;
 /***/ 35062:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _arity =
-/*#__PURE__*/
-__nccwpck_require__(31414);
-
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var _arity = /*#__PURE__*/__nccwpck_require__(31414);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Accepts a function `fn` and returns a function that guards invocation of
  * `fn` such that `fn` can only ever be called once, no matter how many times
@@ -29099,24 +25182,18 @@ __nccwpck_require__(60713);
  *      addOneOnce(10); //=> 11
  *      addOneOnce(addOneOnce(50)); //=> 11
  */
-
-
-var once =
-/*#__PURE__*/
-_curry1(function once(fn) {
+var once = /*#__PURE__*/_curry1(function once(fn) {
   var called = false;
   var result;
   return _arity(fn.length, function () {
     if (called) {
       return result;
     }
-
     called = true;
     result = fn.apply(this, arguments);
     return result;
   });
 });
-
 module.exports = once;
 
 /***/ }),
@@ -29124,9 +25201,7 @@ module.exports = once;
 /***/ 95283:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Returns the first argument if it is truthy, otherwise the second argument.
  * Acts as the boolean `or` statement if both inputs are `Boolean`s.
@@ -29147,14 +25222,9 @@ __nccwpck_require__(69483);
  *      R.or(false, true); //=> true
  *      R.or(false, false); //=> false
  */
-
-
-var or =
-/*#__PURE__*/
-_curry2(function or(a, b) {
+var or = /*#__PURE__*/_curry2(function or(a, b) {
   return a || b;
 });
-
 module.exports = or;
 
 /***/ }),
@@ -29162,13 +25232,8 @@ module.exports = or;
 /***/ 29380:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _assertPromise =
-/*#__PURE__*/
-__nccwpck_require__(94549);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _assertPromise = /*#__PURE__*/__nccwpck_require__(94549);
 /**
  * Returns the result of applying the onFailure function to the value inside
  * a failed promise. This is useful for handling rejected promises
@@ -29197,16 +25262,10 @@ __nccwpck_require__(94549);
  *      );
  *      recoverFromFailure(12345).then(console.log);
  */
-
-
-var otherwise =
-/*#__PURE__*/
-_curry2(function otherwise(f, p) {
+var otherwise = /*#__PURE__*/_curry2(function otherwise(f, p) {
   _assertPromise('otherwise', p);
-
   return p.then(null, f);
 });
-
 module.exports = otherwise;
 
 /***/ }),
@@ -29214,12 +25273,8 @@ module.exports = otherwise;
 /***/ 79185:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597); // `Identity` is a functor that holds a single value, where `map` simply
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597); // `Identity` is a functor that holds a single value, where `map` simply
 // transforms the held value with the provided function.
-
-
 var Identity = function (x) {
   return {
     value: x,
@@ -29228,6 +25283,7 @@ var Identity = function (x) {
     }
   };
 };
+
 /**
  * Returns the result of "setting" the portion of the given data structure
  * focused by the given lens to the result of applying the given function to
@@ -29250,11 +25306,7 @@ var Identity = function (x) {
  *
  *      R.over(headLens, R.toUpper, ['foo', 'bar', 'baz']); //=> ['FOO', 'bar', 'baz']
  */
-
-
-var over =
-/*#__PURE__*/
-_curry3(function over(lens, f, x) {
+var over = /*#__PURE__*/_curry3(function over(lens, f, x) {
   // The value returned by the getter function is first transformed with `f`,
   // then set as the value of an `Identity`. This is then mapped over with the
   // setter function of the lens.
@@ -29262,7 +25314,6 @@ _curry3(function over(lens, f, x) {
     return Identity(f(y));
   })(x).value;
 });
-
 module.exports = over;
 
 /***/ }),
@@ -29270,9 +25321,7 @@ module.exports = over;
 /***/ 67314:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Takes two arguments, `fst` and `snd`, and returns `[fst, snd]`.
  *
@@ -29289,14 +25338,9 @@ __nccwpck_require__(69483);
  *
  *      R.pair('foo', 'bar'); //=> ['foo', 'bar']
  */
-
-
-var pair =
-/*#__PURE__*/
-_curry2(function pair(fst, snd) {
+var pair = /*#__PURE__*/_curry2(function pair(fst, snd) {
   return [fst, snd];
 });
-
 module.exports = pair;
 
 /***/ }),
@@ -29304,13 +25348,8 @@ module.exports = pair;
 /***/ 14982:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _concat =
-/*#__PURE__*/
-__nccwpck_require__(68118);
-
-var _createPartialApplicator =
-/*#__PURE__*/
-__nccwpck_require__(18981);
+var _concat = /*#__PURE__*/__nccwpck_require__(68118);
+var _createPartialApplicator = /*#__PURE__*/__nccwpck_require__(18981);
 /**
  * Takes a function `f` and a list of arguments, and returns a function `g`.
  * When applied, `g` returns the result of applying `f` to the arguments
@@ -29339,12 +25378,7 @@ __nccwpck_require__(18981);
  *      sayHelloToMs('Jane', 'Jones'); //=> 'Hello, Ms. Jane Jones!'
  * @symb R.partial(f, [a, b])(c, d) = f(a, b, c, d)
  */
-
-
-var partial =
-/*#__PURE__*/
-_createPartialApplicator(_concat);
-
+var partial = /*#__PURE__*/_createPartialApplicator(_concat);
 module.exports = partial;
 
 /***/ }),
@@ -29352,13 +25386,8 @@ module.exports = partial;
 /***/ 51291:
 /***/ (function(module, __unused_webpack_exports, __nccwpck_require__) {
 
-var mergeDeepRight =
-/*#__PURE__*/
-__nccwpck_require__(39277);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var mergeDeepRight = /*#__PURE__*/__nccwpck_require__(39277);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Takes a function `f` and an object, and returns a function `g`.
  * When applied, `g` returns the result of applying `f` to the object
@@ -29387,12 +25416,7 @@ __nccwpck_require__(69483);
  *      sayHelloToMs({ firstName: 'Jane', lastName: 'Jones' }); //=> 'Hello, Ms. Jane Jones!'
  * @symb R.partialObject(f, { a, b })({ c, d }) = f({ a, b, c, d })
  */
-
-
-var partialObject =
-/*#__PURE__*/
-_curry2((f, o) => props => f.call(this, mergeDeepRight(o, props)));
-
+var partialObject = /*#__PURE__*/_curry2((f, o) => props => f.call(this, mergeDeepRight(o, props)));
 module.exports = partialObject;
 
 /***/ }),
@@ -29400,17 +25424,9 @@ module.exports = partialObject;
 /***/ 31136:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _concat =
-/*#__PURE__*/
-__nccwpck_require__(68118);
-
-var _createPartialApplicator =
-/*#__PURE__*/
-__nccwpck_require__(18981);
-
-var flip =
-/*#__PURE__*/
-__nccwpck_require__(95804);
+var _concat = /*#__PURE__*/__nccwpck_require__(68118);
+var _createPartialApplicator = /*#__PURE__*/__nccwpck_require__(18981);
+var flip = /*#__PURE__*/__nccwpck_require__(95804);
 /**
  * Takes a function `f` and a list of arguments, and returns a function `g`.
  * When applied, `g` returns the result of applying `f` to the arguments
@@ -29435,14 +25451,7 @@ __nccwpck_require__(95804);
  *      greetMsJaneJones('Hello'); //=> 'Hello, Ms. Jane Jones!'
  * @symb R.partialRight(f, [a, b])(c, d) = f(c, d, a, b)
  */
-
-
-var partialRight =
-/*#__PURE__*/
-_createPartialApplicator(
-/*#__PURE__*/
-flip(_concat));
-
+var partialRight = /*#__PURE__*/_createPartialApplicator( /*#__PURE__*/flip(_concat));
 module.exports = partialRight;
 
 /***/ }),
@@ -29450,17 +25459,9 @@ module.exports = partialRight;
 /***/ 60776:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var filter =
-/*#__PURE__*/
-__nccwpck_require__(90983);
-
-var juxt =
-/*#__PURE__*/
-__nccwpck_require__(21897);
-
-var reject =
-/*#__PURE__*/
-__nccwpck_require__(71545);
+var filter = /*#__PURE__*/__nccwpck_require__(90983);
+var juxt = /*#__PURE__*/__nccwpck_require__(21897);
+var reject = /*#__PURE__*/__nccwpck_require__(71545);
 /**
  * Takes a predicate and a list or other `Filterable` object and returns the
  * pair of filterable objects of the same type of elements which do and do not
@@ -29485,11 +25486,7 @@ __nccwpck_require__(71545);
  *      R.partition(R.includes('s'), { a: 'sss', b: 'ttt', foo: 'bars' });
  *      // => [ { a: 'sss', foo: 'bars' }, { b: 'ttt' }  ]
  */
-
-
-var partition =
-/*#__PURE__*/
-juxt([filter, reject]);
+var partition = /*#__PURE__*/juxt([filter, reject]);
 module.exports = partition;
 
 /***/ }),
@@ -29497,13 +25494,8 @@ module.exports = partition;
 /***/ 22767:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var paths =
-/*#__PURE__*/
-__nccwpck_require__(75579);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _path = /*#__PURE__*/__nccwpck_require__(57538);
 /**
  * Retrieves the value at a given path. The nodes of the path can be arbitrary strings or non-negative integers.
  * For anything else, the value is unspecified. Integer paths are meant to index arrays, strings are meant for objects.
@@ -29528,14 +25520,7 @@ __nccwpck_require__(75579);
  *      R.path([2], {'2': 2}); //=> 2
  *      R.path([-2], {'-2': 'a'}); //=> undefined
  */
-
-
-var path =
-/*#__PURE__*/
-_curry2(function path(pathAr, obj) {
-  return paths([pathAr], obj)[0];
-});
-
+var path = /*#__PURE__*/_curry2(_path);
 module.exports = path;
 
 /***/ }),
@@ -29543,17 +25528,9 @@ module.exports = path;
 /***/ 41360:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var equals =
-/*#__PURE__*/
-__nccwpck_require__(50548);
-
-var path =
-/*#__PURE__*/
-__nccwpck_require__(22767);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var _path = /*#__PURE__*/__nccwpck_require__(57538);
+var equals = /*#__PURE__*/__nccwpck_require__(50548);
 /**
  * Determines whether a nested path on an object has a specific value, in
  * [`R.equals`](#equals) terms. Most likely used to filter a list.
@@ -29579,14 +25556,9 @@ __nccwpck_require__(22767);
  *      const isFamous = R.pathEq(90210, ['address', 'zipCode']);
  *      R.filter(isFamous, users); //=> [ user1 ]
  */
-
-
-var pathEq =
-/*#__PURE__*/
-_curry3(function pathEq(val, _path, obj) {
-  return equals(path(_path, obj), val);
+var pathEq = /*#__PURE__*/_curry3(function pathEq(val, pathAr, obj) {
+  return equals(_path(pathAr, obj), val);
 });
-
 module.exports = pathEq;
 
 /***/ }),
@@ -29594,17 +25566,9 @@ module.exports = pathEq;
 /***/ 66328:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var defaultTo =
-/*#__PURE__*/
-__nccwpck_require__(78445);
-
-var path =
-/*#__PURE__*/
-__nccwpck_require__(22767);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var _path = /*#__PURE__*/__nccwpck_require__(57538);
+var defaultTo = /*#__PURE__*/__nccwpck_require__(78445);
 /**
  * If the given, non-null object has a value at the given path, returns the
  * value at that path. Otherwise returns the provided default value.
@@ -29624,14 +25588,9 @@ __nccwpck_require__(22767);
  *      R.pathOr('N/A', ['a', 'b'], {a: {b: 2}}); //=> 2
  *      R.pathOr('N/A', ['a', 'b'], {c: {b: 2}}); //=> "N/A"
  */
-
-
-var pathOr =
-/*#__PURE__*/
-_curry3(function pathOr(d, p, obj) {
-  return defaultTo(d, path(p, obj));
+var pathOr = /*#__PURE__*/_curry3(function pathOr(d, p, obj) {
+  return defaultTo(d, _path(p, obj));
 });
-
 module.exports = pathOr;
 
 /***/ }),
@@ -29639,13 +25598,8 @@ module.exports = pathOr;
 /***/ 39411:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var path =
-/*#__PURE__*/
-__nccwpck_require__(22767);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var _path = /*#__PURE__*/__nccwpck_require__(57538);
 /**
  * Returns `true` if the specified object property at given path satisfies the
  * given predicate; `false` otherwise.
@@ -29666,14 +25620,9 @@ __nccwpck_require__(22767);
  *      R.pathSatisfies(y => y > 0, ['x', 'y'], {x: {y: 2}}); //=> true
  *      R.pathSatisfies(R.is(Object), [], {x: {y: 2}}); //=> true
  */
-
-
-var pathSatisfies =
-/*#__PURE__*/
-_curry3(function pathSatisfies(pred, propPath, obj) {
-  return pred(path(propPath, obj));
+var pathSatisfies = /*#__PURE__*/_curry3(function pathSatisfies(pred, propPath, obj) {
+  return pred(_path(propPath, obj));
 });
-
 module.exports = pathSatisfies;
 
 /***/ }),
@@ -29681,17 +25630,9 @@ module.exports = pathSatisfies;
 /***/ 75579:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _isInteger =
-/*#__PURE__*/
-__nccwpck_require__(87924);
-
-var nth =
-/*#__PURE__*/
-__nccwpck_require__(87280);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _isInteger = /*#__PURE__*/__nccwpck_require__(87924);
+var _nth = /*#__PURE__*/__nccwpck_require__(88303);
 /**
  * Retrieves the values at given paths of an object.
  *
@@ -29710,30 +25651,22 @@ __nccwpck_require__(87280);
  *      R.paths([['a', 'b'], ['p', 0, 'q']], {a: {b: 2}, p: [{q: 3}]}); //=> [2, 3]
  *      R.paths([['a', 'b'], ['p', 'r']], {a: {b: 2}, p: [{q: 3}]}); //=> [2, undefined]
  */
-
-
-var paths =
-/*#__PURE__*/
-_curry2(function paths(pathsArray, obj) {
+var paths = /*#__PURE__*/_curry2(function paths(pathsArray, obj) {
   return pathsArray.map(function (paths) {
     var val = obj;
     var idx = 0;
     var p;
-
     while (idx < paths.length) {
       if (val == null) {
         return;
       }
-
       p = paths[idx];
-      val = _isInteger(p) ? nth(p, val) : val[p];
+      val = _isInteger(p) ? _nth(p, val) : val[p];
       idx += 1;
     }
-
     return val;
   });
 });
-
 module.exports = paths;
 
 /***/ }),
@@ -29741,9 +25674,7 @@ module.exports = paths;
 /***/ 5315:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Returns a partial copy of an object containing only the keys specified. If
  * the key does not exist, the property is ignored.
@@ -29762,25 +25693,17 @@ __nccwpck_require__(69483);
  *      R.pick(['a', 'd'], {a: 1, b: 2, c: 3, d: 4}); //=> {a: 1, d: 4}
  *      R.pick(['a', 'e', 'f'], {a: 1, b: 2, c: 3, d: 4}); //=> {a: 1}
  */
-
-
-var pick =
-/*#__PURE__*/
-_curry2(function pick(names, obj) {
+var pick = /*#__PURE__*/_curry2(function pick(names, obj) {
   var result = {};
   var idx = 0;
-
   while (idx < names.length) {
     if (names[idx] in obj) {
       result[names[idx]] = obj[names[idx]];
     }
-
     idx += 1;
   }
-
   return result;
 });
-
 module.exports = pick;
 
 /***/ }),
@@ -29788,9 +25711,7 @@ module.exports = pick;
 /***/ 83234:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Similar to `pick` except that this one includes a `key: undefined` pair for
  * properties that don't exist.
@@ -29809,24 +25730,17 @@ __nccwpck_require__(69483);
  *      R.pickAll(['a', 'd'], {a: 1, b: 2, c: 3, d: 4}); //=> {a: 1, d: 4}
  *      R.pickAll(['a', 'e', 'f'], {a: 1, b: 2, c: 3, d: 4}); //=> {a: 1, e: undefined, f: undefined}
  */
-
-
-var pickAll =
-/*#__PURE__*/
-_curry2(function pickAll(names, obj) {
+var pickAll = /*#__PURE__*/_curry2(function pickAll(names, obj) {
   var result = {};
   var idx = 0;
   var len = names.length;
-
   while (idx < len) {
     var name = names[idx];
     result[name] = obj[name];
     idx += 1;
   }
-
   return result;
 });
-
 module.exports = pickAll;
 
 /***/ }),
@@ -29834,9 +25748,7 @@ module.exports = pickAll;
 /***/ 15565:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Returns a partial copy of an object containing only the keys that satisfy
  * the supplied predicate.
@@ -29857,22 +25769,15 @@ __nccwpck_require__(69483);
  *      const isUpperCase = (val, key) => key.toUpperCase() === key;
  *      R.pickBy(isUpperCase, {a: 1, b: 2, A: 3, B: 4}); //=> {A: 3, B: 4}
  */
-
-
-var pickBy =
-/*#__PURE__*/
-_curry2(function pickBy(test, obj) {
+var pickBy = /*#__PURE__*/_curry2(function pickBy(test, obj) {
   var result = {};
-
   for (var prop in obj) {
     if (test(obj[prop], prop, obj)) {
       result[prop] = obj[prop];
     }
   }
-
   return result;
 });
-
 module.exports = pickBy;
 
 /***/ }),
@@ -29880,21 +25785,10 @@ module.exports = pickBy;
 /***/ 44216:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _arity =
-/*#__PURE__*/
-__nccwpck_require__(31414);
-
-var _pipe =
-/*#__PURE__*/
-__nccwpck_require__(4592);
-
-var reduce =
-/*#__PURE__*/
-__nccwpck_require__(31941);
-
-var tail =
-/*#__PURE__*/
-__nccwpck_require__(54900);
+var _arity = /*#__PURE__*/__nccwpck_require__(31414);
+var _pipe = /*#__PURE__*/__nccwpck_require__(4592);
+var reduce = /*#__PURE__*/__nccwpck_require__(31941);
+var tail = /*#__PURE__*/__nccwpck_require__(54900);
 /**
  * Performs left-to-right function composition. The first argument may have
  * any arity; the remaining arguments must be unary.
@@ -29919,16 +25813,12 @@ __nccwpck_require__(54900);
  * @symb R.pipe(f, g, h)(a, b) = h(g(f(a, b)))
  * @symb R.pipe(f, g, h)(a)(b) = h(g(f(a)))(b)
  */
-
-
 function pipe() {
   if (arguments.length === 0) {
     throw new Error('pipe requires at least one argument');
   }
-
   return _arity(arguments[0].length, reduce(_pipe, arguments[0], tail(arguments)));
 }
-
 module.exports = pipe;
 
 /***/ }),
@@ -29936,29 +25826,12 @@ module.exports = pipe;
 /***/ 17709:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _arity =
-/*#__PURE__*/
-__nccwpck_require__(31414);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var head =
-/*#__PURE__*/
-__nccwpck_require__(8119);
-
-var _reduce =
-/*#__PURE__*/
-__nccwpck_require__(92872);
-
-var tail =
-/*#__PURE__*/
-__nccwpck_require__(54900);
-
-var identity =
-/*#__PURE__*/
-__nccwpck_require__(46304);
+var _arity = /*#__PURE__*/__nccwpck_require__(31414);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var head = /*#__PURE__*/__nccwpck_require__(8119);
+var _reduce = /*#__PURE__*/__nccwpck_require__(92872);
+var tail = /*#__PURE__*/__nccwpck_require__(54900);
+var identity = /*#__PURE__*/__nccwpck_require__(46304);
 /**
  * Performs left-to-right function composition using transforming function. The first function may have
  * any arity; the remaining functions must be unary.
@@ -29983,15 +25856,10 @@ __nccwpck_require__(46304);
  *      f(3, 4); // -(3^4) + 1
  * @symb R.pipeWith(f)([g, h, i])(...args) = f(i, f(h, g(...args)))
  */
-
-
-var pipeWith =
-/*#__PURE__*/
-_curry2(function pipeWith(xf, list) {
+var pipeWith = /*#__PURE__*/_curry2(function pipeWith(xf, list) {
   if (list.length <= 0) {
     return identity;
   }
-
   var headList = head(list);
   var tailList = tail(list);
   return _arity(headList.length, function () {
@@ -30000,7 +25868,6 @@ _curry2(function pipeWith(xf, list) {
     }, headList.apply(this, arguments), tailList);
   });
 });
-
 module.exports = pipeWith;
 
 /***/ }),
@@ -30008,17 +25875,9 @@ module.exports = pipeWith;
 /***/ 97413:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var map =
-/*#__PURE__*/
-__nccwpck_require__(28820);
-
-var prop =
-/*#__PURE__*/
-__nccwpck_require__(32135);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var map = /*#__PURE__*/__nccwpck_require__(28820);
+var prop = /*#__PURE__*/__nccwpck_require__(32135);
 /**
  * Returns a new list by plucking the same named property off all objects in
  * the list supplied.
@@ -30046,14 +25905,9 @@ __nccwpck_require__(32135);
  * @symb R.pluck('x', [{x: 1, y: 2}, {x: 3, y: 4}, {x: 5, y: 6}]) = [1, 3, 5]
  * @symb R.pluck(0, [[1, 2], [3, 4], [5, 6]]) = [1, 3, 5]
  */
-
-
-var pluck =
-/*#__PURE__*/
-_curry2(function pluck(p, list) {
+var pluck = /*#__PURE__*/_curry2(function pluck(p, list) {
   return map(prop(p), list);
 });
-
 module.exports = pluck;
 
 /***/ }),
@@ -30061,13 +25915,8 @@ module.exports = pluck;
 /***/ 6622:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _concat =
-/*#__PURE__*/
-__nccwpck_require__(68118);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _concat = /*#__PURE__*/__nccwpck_require__(68118);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Returns a new list with the given element at the front, followed by the
  * contents of the list.
@@ -30085,14 +25934,9 @@ __nccwpck_require__(69483);
  *
  *      R.prepend('fee', ['fi', 'fo', 'fum']); //=> ['fee', 'fi', 'fo', 'fum']
  */
-
-
-var prepend =
-/*#__PURE__*/
-_curry2(function prepend(el, list) {
+var prepend = /*#__PURE__*/_curry2(function prepend(el, list) {
   return _concat([el], list);
 });
-
 module.exports = prepend;
 
 /***/ }),
@@ -30100,13 +25944,8 @@ module.exports = prepend;
 /***/ 98463:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var multiply =
-/*#__PURE__*/
-__nccwpck_require__(3858);
-
-var reduce =
-/*#__PURE__*/
-__nccwpck_require__(31941);
+var multiply = /*#__PURE__*/__nccwpck_require__(3858);
+var reduce = /*#__PURE__*/__nccwpck_require__(31941);
 /**
  * Multiplies together all the elements of a list.
  *
@@ -30122,11 +25961,7 @@ __nccwpck_require__(31941);
  *
  *      R.product([2,4,6,8,100,1]); //=> 38400
  */
-
-
-var product =
-/*#__PURE__*/
-reduce(multiply, 1);
+var product = /*#__PURE__*/reduce(multiply, 1);
 module.exports = product;
 
 /***/ }),
@@ -30134,21 +25969,10 @@ module.exports = product;
 /***/ 87615:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _map =
-/*#__PURE__*/
-__nccwpck_require__(38077);
-
-var identity =
-/*#__PURE__*/
-__nccwpck_require__(46304);
-
-var pickAll =
-/*#__PURE__*/
-__nccwpck_require__(83234);
-
-var useWith =
-/*#__PURE__*/
-__nccwpck_require__(36487);
+var _map = /*#__PURE__*/__nccwpck_require__(38077);
+var identity = /*#__PURE__*/__nccwpck_require__(46304);
+var pickAll = /*#__PURE__*/__nccwpck_require__(83234);
+var useWith = /*#__PURE__*/__nccwpck_require__(36487);
 /**
  * Reasonable analog to SQL `select` statement.
  *
@@ -30169,12 +25993,7 @@ __nccwpck_require__(36487);
  *      const kids = [abby, fred];
  *      R.project(['name', 'grade'], kids); //=> [{name: 'Abby', grade: 2}, {name: 'Fred', grade: 7}]
  */
-
-
-var project =
-/*#__PURE__*/
-useWith(_map, [pickAll, identity]); // passing `identity` gives correct arity
-
+var project = /*#__PURE__*/useWith(_map, [pickAll, identity]); // passing `identity` gives correct arity
 module.exports = project;
 
 /***/ }),
@@ -30182,21 +26001,10 @@ module.exports = project;
 /***/ 53743:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _promap =
-/*#__PURE__*/
-__nccwpck_require__(55843);
-
-var _xpromap =
-/*#__PURE__*/
-__nccwpck_require__(86093);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _promap = /*#__PURE__*/__nccwpck_require__(55843);
+var _xpromap = /*#__PURE__*/__nccwpck_require__(86093);
 /**
  * Takes two functions as pre- and post- processors respectively for a third function,
  * i.e. `promap(f, g, h)(x) === g(h(f(x)))`.
@@ -30226,14 +26034,7 @@ __nccwpck_require__(86093);
  * @symb R.promap(f, g, h) = x => g(h(f(x)))
  * @symb R.promap(f, g, profunctor) = profunctor.promap(f, g)
  */
-
-
-var promap =
-/*#__PURE__*/
-_curry3(
-/*#__PURE__*/
-_dispatchable(['fantasy-land/promap', 'promap'], _xpromap, _promap));
-
+var promap = /*#__PURE__*/_curry3( /*#__PURE__*/_dispatchable(['fantasy-land/promap', 'promap'], _xpromap, _promap));
 module.exports = promap;
 
 /***/ }),
@@ -30241,17 +26042,9 @@ module.exports = promap;
 /***/ 32135:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _isInteger =
-/*#__PURE__*/
-__nccwpck_require__(87924);
-
-var nth =
-/*#__PURE__*/
-__nccwpck_require__(87280);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _isInteger = /*#__PURE__*/__nccwpck_require__(87924);
+var _nth = /*#__PURE__*/__nccwpck_require__(88303);
 /**
  * Returns a function that when supplied an object returns the indicated
  * property of that object, if it exists.
@@ -30273,18 +26066,12 @@ __nccwpck_require__(87280);
  *      R.prop(0, [100]); //=> 100
  *      R.compose(R.inc, R.prop('x'))({ x: 3 }) //=> 4
  */
-
-
-var prop =
-/*#__PURE__*/
-_curry2(function prop(p, obj) {
+var prop = /*#__PURE__*/_curry2(function prop(p, obj) {
   if (obj == null) {
     return;
   }
-
-  return _isInteger(p) ? nth(p, obj) : obj[p];
+  return _isInteger(p) ? _nth(p, obj) : obj[p];
 });
-
 module.exports = prop;
 
 /***/ }),
@@ -30292,17 +26079,9 @@ module.exports = prop;
 /***/ 77301:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var prop =
-/*#__PURE__*/
-__nccwpck_require__(32135);
-
-var equals =
-/*#__PURE__*/
-__nccwpck_require__(50548);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var prop = /*#__PURE__*/__nccwpck_require__(32135);
+var equals = /*#__PURE__*/__nccwpck_require__(50548);
 /**
  * Returns `true` if the specified object property is equal, in
  * [`R.equals`](#equals) terms, to the given value; `false` otherwise.
@@ -30330,14 +26109,9 @@ __nccwpck_require__(50548);
  *      const hasBrownHair = R.propEq('brown', 'hair');
  *      R.filter(hasBrownHair, kids); //=> [fred, rusty]
  */
-
-
-var propEq =
-/*#__PURE__*/
-_curry3(function propEq(val, name, obj) {
+var propEq = /*#__PURE__*/_curry3(function propEq(val, name, obj) {
   return equals(val, prop(name, obj));
 });
-
 module.exports = propEq;
 
 /***/ }),
@@ -30345,17 +26119,9 @@ module.exports = propEq;
 /***/ 29867:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var prop =
-/*#__PURE__*/
-__nccwpck_require__(32135);
-
-var is =
-/*#__PURE__*/
-__nccwpck_require__(4008);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var prop = /*#__PURE__*/__nccwpck_require__(32135);
+var is = /*#__PURE__*/__nccwpck_require__(4008);
 /**
  * Returns `true` if the specified object property is of the given type;
  * `false` otherwise.
@@ -30376,14 +26142,9 @@ __nccwpck_require__(4008);
  *      R.propIs(Number, 'x', {x: 'foo'});    //=> false
  *      R.propIs(Number, 'x', {});            //=> false
  */
-
-
-var propIs =
-/*#__PURE__*/
-_curry3(function propIs(type, name, obj) {
+var propIs = /*#__PURE__*/_curry3(function propIs(type, name, obj) {
   return is(type, prop(name, obj));
 });
-
 module.exports = propIs;
 
 /***/ }),
@@ -30391,17 +26152,9 @@ module.exports = propIs;
 /***/ 5694:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var defaultTo =
-/*#__PURE__*/
-__nccwpck_require__(78445);
-
-var prop =
-/*#__PURE__*/
-__nccwpck_require__(32135);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var defaultTo = /*#__PURE__*/__nccwpck_require__(78445);
+var prop = /*#__PURE__*/__nccwpck_require__(32135);
 /**
  * Return the specified property of the given non-null object if the property
  * is present and it's value is not `null`, `undefined` or `NaN`.
@@ -30429,14 +26182,9 @@ __nccwpck_require__(32135);
  *      favorite(alice);  //=> undefined
  *      favoriteWithDefault(alice);  //=> 'Ramda'
  */
-
-
-var propOr =
-/*#__PURE__*/
-_curry3(function propOr(val, p, obj) {
+var propOr = /*#__PURE__*/_curry3(function propOr(val, p, obj) {
   return defaultTo(val, prop(p, obj));
 });
-
 module.exports = propOr;
 
 /***/ }),
@@ -30444,13 +26192,8 @@ module.exports = propOr;
 /***/ 46891:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var prop =
-/*#__PURE__*/
-__nccwpck_require__(32135);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var prop = /*#__PURE__*/__nccwpck_require__(32135);
 /**
  * Returns `true` if the specified object property satisfies the given
  * predicate; `false` otherwise. You can test multiple properties with
@@ -30470,14 +26213,9 @@ __nccwpck_require__(32135);
  *
  *      R.propSatisfies(x => x > 0, 'x', {x: 1, y: 2}); //=> true
  */
-
-
-var propSatisfies =
-/*#__PURE__*/
-_curry3(function propSatisfies(pred, name, obj) {
+var propSatisfies = /*#__PURE__*/_curry3(function propSatisfies(pred, name, obj) {
   return pred(prop(name, obj));
 });
-
 module.exports = propSatisfies;
 
 /***/ }),
@@ -30485,13 +26223,8 @@ module.exports = propSatisfies;
 /***/ 67807:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var path =
-/*#__PURE__*/
-__nccwpck_require__(22767);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var prop = /*#__PURE__*/__nccwpck_require__(32135);
 /**
  * Acts as multiple `prop`: array of keys in, array of values out. Preserves
  * order.
@@ -30513,16 +26246,11 @@ __nccwpck_require__(22767);
  *      const fullName = R.compose(R.join(' '), R.props(['first', 'last']));
  *      fullName({last: 'Bullet-Tooth', age: 33, first: 'Tony'}); //=> 'Tony Bullet-Tooth'
  */
-
-
-var props =
-/*#__PURE__*/
-_curry2(function props(ps, obj) {
+var props = /*#__PURE__*/_curry2(function props(ps, obj) {
   return ps.map(function (p) {
-    return path([p], obj);
+    return prop(p, obj);
   });
 });
-
 module.exports = props;
 
 /***/ }),
@@ -30530,13 +26258,8 @@ module.exports = props;
 /***/ 61808:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _isNumber =
-/*#__PURE__*/
-__nccwpck_require__(47573);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _isNumber = /*#__PURE__*/__nccwpck_require__(47573);
 /**
  * Returns a list of numbers from `from` (inclusive) to `to` (exclusive).
  *
@@ -30553,26 +26276,19 @@ __nccwpck_require__(47573);
  *      R.range(1, 5);    //=> [1, 2, 3, 4]
  *      R.range(50, 53);  //=> [50, 51, 52]
  */
-
-
-var range =
-/*#__PURE__*/
-_curry2(function range(from, to) {
+var range = /*#__PURE__*/_curry2(function range(from, to) {
   if (!(_isNumber(from) && _isNumber(to))) {
     throw new TypeError('Both arguments to range must be numbers');
   }
-
-  var result = [];
-  var n = from;
-
-  while (n < to) {
-    result.push(n);
-    n += 1;
+  var result = Array(from < to ? to - from : 0);
+  var finish = from < 0 ? to + Math.abs(from) : to - from;
+  var idx = 0;
+  while (idx < finish) {
+    result[idx] = idx + from;
+    idx += 1;
   }
-
   return result;
 });
-
 module.exports = range;
 
 /***/ }),
@@ -30580,17 +26296,9 @@ module.exports = range;
 /***/ 31941:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var _xReduce =
-/*#__PURE__*/
-__nccwpck_require__(60694);
-
-var _xwrap =
-/*#__PURE__*/
-__nccwpck_require__(97393);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var _xReduce = /*#__PURE__*/__nccwpck_require__(60694);
+var _xwrap = /*#__PURE__*/__nccwpck_require__(97393);
 /**
  * Returns a single item by iterating through the list, successively calling
  * the iterator function and passing it an accumulator value and the current
@@ -30643,14 +26351,9 @@ __nccwpck_require__(97393);
  *
  * @symb R.reduce(f, a, [b, c, d]) = f(f(f(a, b), c), d)
  */
-
-
-var reduce =
-/*#__PURE__*/
-_curry3(function (xf, acc, list) {
+var reduce = /*#__PURE__*/_curry3(function (xf, acc, list) {
   return _xReduce(typeof xf === 'function' ? _xwrap(xf) : xf, acc, list);
 });
-
 module.exports = reduce;
 
 /***/ }),
@@ -30658,37 +26361,14 @@ module.exports = reduce;
 /***/ 35645:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _clone =
-/*#__PURE__*/
-__nccwpck_require__(12726);
-
-var _curryN =
-/*#__PURE__*/
-__nccwpck_require__(14106);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _has =
-/*#__PURE__*/
-__nccwpck_require__(41693);
-
-var _reduced =
-/*#__PURE__*/
-__nccwpck_require__(59400);
-
-var _xReduce =
-/*#__PURE__*/
-__nccwpck_require__(60694);
-
-var _xreduceBy =
-/*#__PURE__*/
-__nccwpck_require__(20248);
-
-var _xwrap =
-/*#__PURE__*/
-__nccwpck_require__(97393);
+var _clone = /*#__PURE__*/__nccwpck_require__(12726);
+var _curryN = /*#__PURE__*/__nccwpck_require__(14106);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _has = /*#__PURE__*/__nccwpck_require__(41693);
+var _reduced = /*#__PURE__*/__nccwpck_require__(59400);
+var _xReduce = /*#__PURE__*/__nccwpck_require__(60694);
+var _xreduceBy = /*#__PURE__*/__nccwpck_require__(20248);
+var _xwrap = /*#__PURE__*/__nccwpck_require__(97393);
 /**
  * Groups the elements of the list according to the result of calling
  * the String-returning function `keyFn` on each element and reduces the elements
@@ -30733,28 +26413,18 @@ __nccwpck_require__(97393);
  *      reduceBy(groupNames, [], toGrade, students)
  *      //=> {"A": ["Dora"], "B": ["Abby", "Curt"], "F": ["Bart"]}
  */
-
-
-var reduceBy =
-/*#__PURE__*/
-_curryN(4, [],
-/*#__PURE__*/
-_dispatchable([], _xreduceBy, function reduceBy(valueFn, valueAcc, keyFn, list) {
+var reduceBy = /*#__PURE__*/_curryN(4, [], /*#__PURE__*/_dispatchable([], _xreduceBy, function reduceBy(valueFn, valueAcc, keyFn, list) {
   var xf = _xwrap(function (acc, elt) {
     var key = keyFn(elt);
     var value = valueFn(_has(key, acc) ? acc[key] : _clone(valueAcc, false), elt);
-
     if (value && value['@@transducer/reduced']) {
       return _reduced(acc);
     }
-
     acc[key] = value;
     return acc;
   });
-
   return _xReduce(xf, {}, list);
 }));
-
 module.exports = reduceBy;
 
 /***/ }),
@@ -30762,9 +26432,7 @@ module.exports = reduceBy;
 /***/ 50928:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * Returns a single item by iterating through the list, successively calling
  * the iterator function and passing it an accumulator value and the current
@@ -30814,27 +26482,18 @@ __nccwpck_require__(37597);
  *
  * @symb R.reduceRight(f, a, [b, c, d]) = f(b, f(c, f(d, a)))
  */
-
-
-var reduceRight =
-/*#__PURE__*/
-_curry3(function reduceRight(fn, acc, list) {
+var reduceRight = /*#__PURE__*/_curry3(function reduceRight(fn, acc, list) {
   var idx = list.length - 1;
-
   while (idx >= 0) {
     acc = fn(list[idx], acc);
-
     if (acc && acc['@@transducer/reduced']) {
       acc = acc['@@transducer/value'];
       break;
     }
-
     idx -= 1;
   }
-
   return acc;
 });
-
 module.exports = reduceRight;
 
 /***/ }),
@@ -30842,21 +26501,10 @@ module.exports = reduceRight;
 /***/ 16534:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curryN =
-/*#__PURE__*/
-__nccwpck_require__(14106);
-
-var _xReduce =
-/*#__PURE__*/
-__nccwpck_require__(60694);
-
-var _xwrap =
-/*#__PURE__*/
-__nccwpck_require__(97393);
-
-var _reduced =
-/*#__PURE__*/
-__nccwpck_require__(59400);
+var _curryN = /*#__PURE__*/__nccwpck_require__(14106);
+var _xReduce = /*#__PURE__*/__nccwpck_require__(60694);
+var _xwrap = /*#__PURE__*/__nccwpck_require__(97393);
+var _reduced = /*#__PURE__*/__nccwpck_require__(59400);
 /**
  * Like [`reduce`](#reduce), `reduceWhile` returns a single item by iterating
  * through the list, successively calling the iterator function. `reduceWhile`
@@ -30887,18 +26535,12 @@ __nccwpck_require__(59400);
  *      const ys = [2, 4, 6]
  *      R.reduceWhile(isOdd, R.add, 111, ys); //=> 111
  */
-
-
-var reduceWhile =
-/*#__PURE__*/
-_curryN(4, [], function _reduceWhile(pred, fn, a, list) {
+var reduceWhile = /*#__PURE__*/_curryN(4, [], function _reduceWhile(pred, fn, a, list) {
   var xf = _xwrap(function (acc, x) {
     return pred(acc, x) ? fn(acc, x) : _reduced(acc);
   });
-
   return _xReduce(xf, a, list);
 });
-
 module.exports = reduceWhile;
 
 /***/ }),
@@ -30906,13 +26548,8 @@ module.exports = reduceWhile;
 /***/ 84505:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var _reduced =
-/*#__PURE__*/
-__nccwpck_require__(59400);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _reduced = /*#__PURE__*/__nccwpck_require__(59400);
 /**
  * Returns a value wrapped to indicate that it is the final value of the reduce
  * and transduce functions. The returned value should be considered a black
@@ -30940,12 +26577,7 @@ __nccwpck_require__(59400);
  *       [],
  *       [1, 2, 3, 4, 5]) // [1, 2, 3]
  */
-
-
-var reduced =
-/*#__PURE__*/
-_curry1(_reduced);
-
+var reduced = /*#__PURE__*/_curry1(_reduced);
 module.exports = reduced;
 
 /***/ }),
@@ -30953,17 +26585,9 @@ module.exports = reduced;
 /***/ 71545:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _complement =
-/*#__PURE__*/
-__nccwpck_require__(3134);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var filter =
-/*#__PURE__*/
-__nccwpck_require__(90983);
+var _complement = /*#__PURE__*/__nccwpck_require__(3134);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var filter = /*#__PURE__*/__nccwpck_require__(90983);
 /**
  * The complement of [`filter`](#filter).
  *
@@ -30988,14 +26612,9 @@ __nccwpck_require__(90983);
  *
  *      R.reject(isOdd, {a: 1, b: 2, c: 3, d: 4}); //=> {b: 2, d: 4}
  */
-
-
-var reject =
-/*#__PURE__*/
-_curry2(function reject(pred, filterable) {
+var reject = /*#__PURE__*/_curry2(function reject(pred, filterable) {
   return filter(_complement(pred), filterable);
 });
-
 module.exports = reject;
 
 /***/ }),
@@ -31003,9 +26622,7 @@ module.exports = reject;
 /***/ 10311:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * Removes the sub-list of `list` starting at index `start` and containing
  * `count` elements. _Note that this is not destructive_: it returns a copy of
@@ -31026,16 +26643,11 @@ __nccwpck_require__(37597);
  *
  *      R.remove(2, 3, [1,2,3,4,5,6,7,8]); //=> [1,2,6,7,8]
  */
-
-
-var remove =
-/*#__PURE__*/
-_curry3(function remove(start, count, list) {
+var remove = /*#__PURE__*/_curry3(function remove(start, count, list) {
   var result = Array.prototype.slice.call(list, 0);
   result.splice(start, count);
   return result;
 });
-
 module.exports = remove;
 
 /***/ }),
@@ -31043,17 +26655,9 @@ module.exports = remove;
 /***/ 4868:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var always =
-/*#__PURE__*/
-__nccwpck_require__(37770);
-
-var times =
-/*#__PURE__*/
-__nccwpck_require__(72791);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var always = /*#__PURE__*/__nccwpck_require__(37770);
+var times = /*#__PURE__*/__nccwpck_require__(72791);
 /**
  * Returns a fixed list of size `n` containing a specified identical value.
  *
@@ -31077,14 +26681,9 @@ __nccwpck_require__(72791);
  * @symb R.repeat(a, 1) = [a]
  * @symb R.repeat(a, 2) = [a, a]
  */
-
-
-var repeat =
-/*#__PURE__*/
-_curry2(function repeat(value, n) {
+var repeat = /*#__PURE__*/_curry2(function repeat(value, n) {
   return times(always(value), n);
 });
-
 module.exports = repeat;
 
 /***/ }),
@@ -31092,9 +26691,7 @@ module.exports = repeat;
 /***/ 77864:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * Replace a substring or regex match in a string with a replacement.
  *
@@ -31119,14 +26716,9 @@ __nccwpck_require__(37597);
  *      // Use the "g" (global) flag to replace all occurrences:
  *      R.replace(/foo/g, 'bar', 'foo foo foo'); //=> 'bar bar bar'
  */
-
-
-var replace =
-/*#__PURE__*/
-_curry3(function replace(regex, replacement, str) {
+var replace = /*#__PURE__*/_curry3(function replace(regex, replacement, str) {
   return str.replace(regex, replacement);
 });
-
 module.exports = replace;
 
 /***/ }),
@@ -31134,13 +26726,8 @@ module.exports = replace;
 /***/ 68495:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var _isString =
-/*#__PURE__*/
-__nccwpck_require__(59076);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _isString = /*#__PURE__*/__nccwpck_require__(59076);
 /**
  * Returns a new list or string with the elements or characters in reverse
  * order.
@@ -31165,14 +26752,9 @@ __nccwpck_require__(59076);
  *      R.reverse('a');        //=> 'a'
  *      R.reverse('');         //=> ''
  */
-
-
-var reverse =
-/*#__PURE__*/
-_curry1(function reverse(list) {
+var reverse = /*#__PURE__*/_curry1(function reverse(list) {
   return _isString(list) ? list.split('').reverse().join('') : Array.prototype.slice.call(list, 0).reverse();
 });
-
 module.exports = reverse;
 
 /***/ }),
@@ -31180,17 +26762,9 @@ module.exports = reverse;
 /***/ 55426:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xscan =
-/*#__PURE__*/
-__nccwpck_require__(84586);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xscan = /*#__PURE__*/__nccwpck_require__(84586);
 /**
  * Scan is similar to [`reduce`](#reduce), but returns a list of successively
  * reduced values from the left.
@@ -31214,26 +26788,18 @@ __nccwpck_require__(84586);
  *      const factorials = R.scan(R.multiply, 1, numbers); //=> [1, 1, 2, 6, 24]
  * @symb R.scan(f, a, [b, c]) = [a, f(a, b), f(f(a, b), c)]
  */
-
-
-var scan =
-/*#__PURE__*/
-_curry3(
-/*#__PURE__*/
-_dispatchable([], _xscan, function scan(fn, acc, list) {
+var scan = /*#__PURE__*/_curry3( /*#__PURE__*/_dispatchable([], _xscan, function scan(fn, acc, list) {
   var idx = 0;
   var len = list.length;
-  var result = [acc];
-
+  var result = Array(len + 1);
+  result[0] = acc;
   while (idx < len) {
     acc = fn(acc, list[idx]);
     result[idx + 1] = acc;
     idx += 1;
   }
-
   return result;
 }));
-
 module.exports = scan;
 
 /***/ }),
@@ -31241,29 +26807,12 @@ module.exports = scan;
 /***/ 44534:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var ap =
-/*#__PURE__*/
-__nccwpck_require__(32857);
-
-var map =
-/*#__PURE__*/
-__nccwpck_require__(28820);
-
-var prepend =
-/*#__PURE__*/
-__nccwpck_require__(6622);
-
-var reduceRight =
-/*#__PURE__*/
-__nccwpck_require__(50928);
-
-var identity =
-/*#__PURE__*/
-__nccwpck_require__(44003);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var ap = /*#__PURE__*/__nccwpck_require__(32857);
+var map = /*#__PURE__*/__nccwpck_require__(28820);
+var prepend = /*#__PURE__*/__nccwpck_require__(6622);
+var reduceRight = /*#__PURE__*/__nccwpck_require__(50928);
+var identity = /*#__PURE__*/__nccwpck_require__(44003);
 /**
  * Transforms a [Traversable](https://github.com/fantasyland/fantasy-land#traversable)
  * of [Applicative](https://github.com/fantasyland/fantasy-land#applicative) into an
@@ -31290,11 +26839,7 @@ __nccwpck_require__(44003);
  *      R.sequence(R.of(Array), Just([1, 2, 3])); //=> [Just(1), Just(2), Just(3)]
  *      R.sequence(R.of(Array), Nothing());       //=> [Nothing()]
  */
-
-
-var sequence =
-/*#__PURE__*/
-_curry2(function sequence(F, traversable) {
+var sequence = /*#__PURE__*/_curry2(function sequence(F, traversable) {
   var of = typeof F['fantasy-land/of'] === 'function' ? F['fantasy-land/of'] : typeof F.of === 'function' ? F.of : F;
   var TypeRep = {
     'fantasy-land/of': of
@@ -31303,7 +26848,6 @@ _curry2(function sequence(F, traversable) {
     return ap(map(prepend, x), acc);
   }, of([]), traversable);
 });
-
 module.exports = sequence;
 
 /***/ }),
@@ -31311,17 +26855,9 @@ module.exports = sequence;
 /***/ 10435:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var always =
-/*#__PURE__*/
-__nccwpck_require__(37770);
-
-var over =
-/*#__PURE__*/
-__nccwpck_require__(79185);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var always = /*#__PURE__*/__nccwpck_require__(37770);
+var over = /*#__PURE__*/__nccwpck_require__(79185);
 /**
  * Returns the result of "setting" the portion of the given data structure
  * focused by the given lens to the given value.
@@ -31344,14 +26880,9 @@ __nccwpck_require__(79185);
  *      R.set(xLens, 4, {x: 1, y: 2});  //=> {x: 4, y: 2}
  *      R.set(xLens, 8, {x: 1, y: 2});  //=> {x: 8, y: 2}
  */
-
-
-var set =
-/*#__PURE__*/
-_curry3(function set(lens, v, x) {
+var set = /*#__PURE__*/_curry3(function set(lens, v, x) {
   return over(lens, always(v), x);
 });
-
 module.exports = set;
 
 /***/ }),
@@ -31359,13 +26890,8 @@ module.exports = set;
 /***/ 47108:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _checkForMethod =
-/*#__PURE__*/
-__nccwpck_require__(71373);
-
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _checkForMethod = /*#__PURE__*/__nccwpck_require__(71373);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * Returns the elements of the given list or string (or object with a `slice`
  * method) from `fromIndex` (inclusive) to `toIndex` (exclusive).
@@ -31390,16 +26916,9 @@ __nccwpck_require__(37597);
  *      R.slice(-3, -1, ['a', 'b', 'c', 'd']);      //=> ['b', 'c']
  *      R.slice(0, 3, 'ramda');                     //=> 'ram'
  */
-
-
-var slice =
-/*#__PURE__*/
-_curry3(
-/*#__PURE__*/
-_checkForMethod('slice', function slice(fromIndex, toIndex, list) {
+var slice = /*#__PURE__*/_curry3( /*#__PURE__*/_checkForMethod('slice', function slice(fromIndex, toIndex, list) {
   return Array.prototype.slice.call(list, fromIndex, toIndex);
 }));
-
 module.exports = slice;
 
 /***/ }),
@@ -31407,9 +26926,7 @@ module.exports = slice;
 /***/ 42642:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Returns a copy of the list, sorted according to the comparator function,
  * which should accept two values at a time and return a negative number if the
@@ -31431,14 +26948,9 @@ __nccwpck_require__(69483);
  *      const diff = function(a, b) { return a - b; };
  *      R.sort(diff, [4,2,7,5]); //=> [2, 4, 5, 7]
  */
-
-
-var sort =
-/*#__PURE__*/
-_curry2(function sort(comparator, list) {
+var sort = /*#__PURE__*/_curry2(function sort(comparator, list) {
   return Array.prototype.slice.call(list, 0).sort(comparator);
 });
-
 module.exports = sort;
 
 /***/ }),
@@ -31446,9 +26958,7 @@ module.exports = sort;
 /***/ 39227:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Sorts the list according to the supplied function.
  *
@@ -31482,18 +26992,13 @@ __nccwpck_require__(69483);
  *      const people = [clara, bob, alice];
  *      sortByNameCaseInsensitive(people); //=> [alice, bob, clara]
  */
-
-
-var sortBy =
-/*#__PURE__*/
-_curry2(function sortBy(fn, list) {
+var sortBy = /*#__PURE__*/_curry2(function sortBy(fn, list) {
   return Array.prototype.slice.call(list, 0).sort(function (a, b) {
     var aa = fn(a);
     var bb = fn(b);
     return aa < bb ? -1 : aa > bb ? 1 : 0;
   });
 });
-
 module.exports = sortBy;
 
 /***/ }),
@@ -31501,9 +27006,7 @@ module.exports = sortBy;
 /***/ 47275:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Sorts a list according to a list of comparators.
  *
@@ -31537,24 +27040,17 @@ __nccwpck_require__(69483);
  *      ]);
  *      ageNameSort(people); //=> [alice, clara, bob]
  */
-
-
-var sortWith =
-/*#__PURE__*/
-_curry2(function sortWith(fns, list) {
+var sortWith = /*#__PURE__*/_curry2(function sortWith(fns, list) {
   return Array.prototype.slice.call(list, 0).sort(function (a, b) {
     var result = 0;
     var i = 0;
-
     while (result === 0 && i < fns.length) {
       result = fns[i](a, b);
       i += 1;
     }
-
     return result;
   });
 });
-
 module.exports = sortWith;
 
 /***/ }),
@@ -31562,9 +27058,7 @@ module.exports = sortWith;
 /***/ 49914:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var invoker =
-/*#__PURE__*/
-__nccwpck_require__(44910);
+var invoker = /*#__PURE__*/__nccwpck_require__(44910);
 /**
  * Splits a string into an array of strings based on the given
  * separator.
@@ -31585,11 +27079,7 @@ __nccwpck_require__(44910);
  *
  *      R.split('.', 'a.b.c.xyz.d'); //=> ['a', 'b', 'c', 'xyz', 'd']
  */
-
-
-var split =
-/*#__PURE__*/
-invoker(1, 'split');
+var split = /*#__PURE__*/invoker(1, 'split');
 module.exports = split;
 
 /***/ }),
@@ -31597,17 +27087,9 @@ module.exports = split;
 /***/ 15609:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var length =
-/*#__PURE__*/
-__nccwpck_require__(30819);
-
-var slice =
-/*#__PURE__*/
-__nccwpck_require__(47108);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var length = /*#__PURE__*/__nccwpck_require__(30819);
+var slice = /*#__PURE__*/__nccwpck_require__(47108);
 /**
  * Splits a given list or string at a given index.
  *
@@ -31626,14 +27108,9 @@ __nccwpck_require__(47108);
  *      R.splitAt(5, 'hello world');      //=> ['hello', ' world']
  *      R.splitAt(-1, 'foobar');          //=> ['fooba', 'r']
  */
-
-
-var splitAt =
-/*#__PURE__*/
-_curry2(function splitAt(index, array) {
+var splitAt = /*#__PURE__*/_curry2(function splitAt(index, array) {
   return [slice(0, index, array), slice(index, length(array), array)];
 });
-
 module.exports = splitAt;
 
 /***/ }),
@@ -31641,13 +27118,8 @@ module.exports = splitAt;
 /***/ 64447:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var slice =
-/*#__PURE__*/
-__nccwpck_require__(47108);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var slice = /*#__PURE__*/__nccwpck_require__(47108);
 /**
  * Splits a collection into slices of the specified length.
  *
@@ -31665,25 +27137,17 @@ __nccwpck_require__(47108);
  *      R.splitEvery(3, [1, 2, 3, 4, 5, 6, 7]); //=> [[1, 2, 3], [4, 5, 6], [7]]
  *      R.splitEvery(3, 'foobarbaz'); //=> ['foo', 'bar', 'baz']
  */
-
-
-var splitEvery =
-/*#__PURE__*/
-_curry2(function splitEvery(n, list) {
+var splitEvery = /*#__PURE__*/_curry2(function splitEvery(n, list) {
   if (n <= 0) {
     throw new Error('First argument to splitEvery must be a positive integer');
   }
-
   var result = [];
   var idx = 0;
-
   while (idx < list.length) {
     result.push(slice(idx, idx += n, list));
   }
-
   return result;
 });
-
 module.exports = splitEvery;
 
 /***/ }),
@@ -31691,9 +27155,7 @@ module.exports = splitEvery;
 /***/ 97129:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Takes a list and a predicate and returns a pair of lists with the following properties:
  *
@@ -31713,23 +27175,16 @@ __nccwpck_require__(69483);
  *
  *      R.splitWhen(R.equals(2), [1, 2, 3, 1, 2, 3]);   //=> [[1], [2, 3, 1, 2, 3]]
  */
-
-
-var splitWhen =
-/*#__PURE__*/
-_curry2(function splitWhen(pred, list) {
+var splitWhen = /*#__PURE__*/_curry2(function splitWhen(pred, list) {
   var idx = 0;
   var len = list.length;
   var prefix = [];
-
   while (idx < len && !pred(list[idx])) {
     prefix.push(list[idx]);
     idx += 1;
   }
-
   return [prefix, Array.prototype.slice.call(list, idx)];
 });
-
 module.exports = splitWhen;
 
 /***/ }),
@@ -31737,15 +27192,13 @@ module.exports = splitWhen;
 /***/ 86392:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curryN =
-/*#__PURE__*/
-__nccwpck_require__(14106);
+var _curryN = /*#__PURE__*/__nccwpck_require__(14106);
 /**
  * Splits an array into slices on every occurrence of a value.
  *
  * @func
  * @memberOf R
- * @since v0.26.1
+ * @since v0.28.0
  * @category List
  * @sig (a -> Boolean) -> [a] -> [[a]]
  * @param {Function} pred The predicate that determines where the array is split.
@@ -31755,28 +27208,20 @@ __nccwpck_require__(14106);
  *
  *      R.splitWhenever(R.equals(2), [1, 2, 3, 2, 4, 5, 2, 6, 7]); //=> [[1], [3], [4, 5], [6, 7]]
  */
-
-
-var splitWhenever =
-/*#__PURE__*/
-_curryN(2, [], function splitWhenever(pred, list) {
+var splitWhenever = /*#__PURE__*/_curryN(2, [], function splitWhenever(pred, list) {
   var acc = [];
   var curr = [];
-
   for (var i = 0; i < list.length; i = i + 1) {
     if (!pred(list[i])) {
       curr.push(list[i]);
     }
-
     if ((i < list.length - 1 && pred(list[i + 1]) || i === list.length - 1) && curr.length > 0) {
       acc.push(curr);
       curr = [];
     }
   }
-
   return acc;
 });
-
 module.exports = splitWhenever;
 
 /***/ }),
@@ -31784,17 +27229,9 @@ module.exports = splitWhenever;
 /***/ 1738:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var equals =
-/*#__PURE__*/
-__nccwpck_require__(50548);
-
-var take =
-/*#__PURE__*/
-__nccwpck_require__(61744);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var equals = /*#__PURE__*/__nccwpck_require__(50548);
+var take = /*#__PURE__*/__nccwpck_require__(61744);
 /**
  * Checks if a list starts with the provided sublist.
  *
@@ -31817,14 +27254,9 @@ __nccwpck_require__(61744);
  *      R.startsWith(['a'], ['a', 'b', 'c'])    //=> true
  *      R.startsWith(['b'], ['a', 'b', 'c'])    //=> false
  */
-
-
-var startsWith =
-/*#__PURE__*/
-_curry2(function (prefix, list) {
+var startsWith = /*#__PURE__*/_curry2(function (prefix, list) {
   return equals(take(prefix.length, list), prefix);
 });
-
 module.exports = startsWith;
 
 /***/ }),
@@ -31832,9 +27264,7 @@ module.exports = startsWith;
 /***/ 97944:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Subtracts its second argument from its first argument.
  *
@@ -31858,14 +27288,9 @@ __nccwpck_require__(69483);
  *      complementaryAngle(30); //=> 60
  *      complementaryAngle(72); //=> 18
  */
-
-
-var subtract =
-/*#__PURE__*/
-_curry2(function subtract(a, b) {
+var subtract = /*#__PURE__*/_curry2(function subtract(a, b) {
   return Number(a) - Number(b);
 });
-
 module.exports = subtract;
 
 /***/ }),
@@ -31873,13 +27298,8 @@ module.exports = subtract;
 /***/ 14761:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var add =
-/*#__PURE__*/
-__nccwpck_require__(38100);
-
-var reduce =
-/*#__PURE__*/
-__nccwpck_require__(31941);
+var add = /*#__PURE__*/__nccwpck_require__(38100);
+var reduce = /*#__PURE__*/__nccwpck_require__(31941);
 /**
  * Adds together all the elements of a list.
  *
@@ -31895,11 +27315,7 @@ __nccwpck_require__(31941);
  *
  *      R.sum([2,4,6,8,100,1]); //=> 121
  */
-
-
-var sum =
-/*#__PURE__*/
-reduce(add, 0);
+var sum = /*#__PURE__*/reduce(add, 0);
 module.exports = sum;
 
 /***/ }),
@@ -31907,35 +27323,20 @@ module.exports = sum;
 /***/ 67795:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var _isArray =
-/*#__PURE__*/
-__nccwpck_require__(56999);
-
-var _isString =
-/*#__PURE__*/
-__nccwpck_require__(59076);
-
-var clone =
-/*#__PURE__*/
-__nccwpck_require__(62675);
-
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var _isArray = /*#__PURE__*/__nccwpck_require__(56999);
+var _isString = /*#__PURE__*/__nccwpck_require__(59076);
+var clone = /*#__PURE__*/__nccwpck_require__(62675);
 var swapObject = function (indexA, indexB, o) {
   var copy = clone(o);
   var properties = Object.getOwnPropertyNames(copy);
-
   if (properties.includes(indexA) && properties.includes(indexB)) {
     var tmp = copy[indexA];
     copy[indexA] = copy[indexB];
     copy[indexB] = tmp;
   }
-
   return copy;
 };
-
 var swapList = function (indexA, indexB, list) {
   var length = list.length;
   var result = list.slice();
@@ -31943,27 +27344,23 @@ var swapList = function (indexA, indexB, list) {
   var positiveIndexB = indexB < 0 ? length + indexB : indexB;
   var positiveMin = Math.min(positiveIndexA, positiveIndexB);
   var positiveMax = Math.max(positiveIndexA, positiveIndexB);
-
   if (positiveIndexA < 0 || positiveIndexA > length) {
     return result;
   }
-
   if (positiveIndexB < 0 || positiveIndexB > length) {
     return result;
   }
-
   if (positiveIndexA === positiveIndexB) {
     return result;
   }
-
   result = [].concat(result.slice(0, positiveMin)).concat([result[positiveMax]]).concat(result.slice(positiveMin + 1, positiveMax)).concat([result[positiveMin]]).concat(result.slice(positiveMax + 1, length));
   return result;
 };
-
 var swapString = function (indexA, indexB, s) {
   var result = swapList(indexA, indexB, s);
   return _isArray(result) ? result.join('') : result;
 };
+
 /**
  * Swap an item, at index `indexA` with another item, at index `indexB`, in an object or a list of elements.
  * A new result will be created containing the new elements order.
@@ -31984,11 +27381,7 @@ var swapString = function (indexA, indexB, s) {
  *      R.swap('a', 'b', {a: 1, b: 2}); //=> {a: 2, b: 1}
  *      R.swap(0, 2, 'foo'); //=> 'oof'
  */
-
-
-var swap =
-/*#__PURE__*/
-_curry3(function (indexA, indexB, o) {
+var swap = /*#__PURE__*/_curry3(function (indexA, indexB, o) {
   if (_isArray(o)) {
     return swapList(indexA, indexB, o);
   } else if (_isString(o)) {
@@ -31997,7 +27390,6 @@ _curry3(function (indexA, indexB, o) {
     return swapObject(indexA, indexB, o);
   }
 });
-
 module.exports = swap;
 
 /***/ }),
@@ -32005,17 +27397,9 @@ module.exports = swap;
 /***/ 74025:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var concat =
-/*#__PURE__*/
-__nccwpck_require__(57833);
-
-var difference =
-/*#__PURE__*/
-__nccwpck_require__(27013);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var concat = /*#__PURE__*/__nccwpck_require__(57833);
+var difference = /*#__PURE__*/__nccwpck_require__(27013);
 /**
  * Finds the set (i.e. no duplicates) of all elements contained in the first or
  * second list, but not both.
@@ -32034,14 +27418,9 @@ __nccwpck_require__(27013);
  *      R.symmetricDifference([1,2,3,4], [7,6,5,4,3]); //=> [1,2,7,6,5]
  *      R.symmetricDifference([7,6,5,4,3], [1,2,3,4]); //=> [7,6,5,1,2]
  */
-
-
-var symmetricDifference =
-/*#__PURE__*/
-_curry2(function symmetricDifference(list1, list2) {
+var symmetricDifference = /*#__PURE__*/_curry2(function symmetricDifference(list1, list2) {
   return concat(difference(list1, list2), difference(list2, list1));
 });
-
 module.exports = symmetricDifference;
 
 /***/ }),
@@ -32049,17 +27428,9 @@ module.exports = symmetricDifference;
 /***/ 92302:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var concat =
-/*#__PURE__*/
-__nccwpck_require__(57833);
-
-var differenceWith =
-/*#__PURE__*/
-__nccwpck_require__(29323);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var concat = /*#__PURE__*/__nccwpck_require__(57833);
+var differenceWith = /*#__PURE__*/__nccwpck_require__(29323);
 /**
  * Finds the set (i.e. no duplicates) of all elements contained in the first or
  * second list, but not both. Duplication is determined according to the value
@@ -32082,14 +27453,9 @@ __nccwpck_require__(29323);
  *      const l2 = [{a: 3}, {a: 4}, {a: 5}, {a: 6}];
  *      R.symmetricDifferenceWith(eqA, l1, l2); //=> [{a: 1}, {a: 2}, {a: 5}, {a: 6}]
  */
-
-
-var symmetricDifferenceWith =
-/*#__PURE__*/
-_curry3(function symmetricDifferenceWith(pred, list1, list2) {
+var symmetricDifferenceWith = /*#__PURE__*/_curry3(function symmetricDifferenceWith(pred, list1, list2) {
   return concat(differenceWith(pred, list1, list2), differenceWith(pred, list2, list1));
 });
-
 module.exports = symmetricDifferenceWith;
 
 /***/ }),
@@ -32097,17 +27463,9 @@ module.exports = symmetricDifferenceWith;
 /***/ 54900:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _checkForMethod =
-/*#__PURE__*/
-__nccwpck_require__(71373);
-
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var slice =
-/*#__PURE__*/
-__nccwpck_require__(47108);
+var _checkForMethod = /*#__PURE__*/__nccwpck_require__(71373);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var slice = /*#__PURE__*/__nccwpck_require__(47108);
 /**
  * Returns all but the first element of the given list or string (or object
  * with a `tail` method).
@@ -32135,16 +27493,7 @@ __nccwpck_require__(47108);
  *      R.tail('a');    //=> ''
  *      R.tail('');     //=> ''
  */
-
-
-var tail =
-/*#__PURE__*/
-_curry1(
-/*#__PURE__*/
-_checkForMethod('tail',
-/*#__PURE__*/
-slice(1, Infinity)));
-
+var tail = /*#__PURE__*/_curry1( /*#__PURE__*/_checkForMethod('tail', /*#__PURE__*/slice(1, Infinity)));
 module.exports = tail;
 
 /***/ }),
@@ -32152,21 +27501,10 @@ module.exports = tail;
 /***/ 61744:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xtake =
-/*#__PURE__*/
-__nccwpck_require__(51664);
-
-var slice =
-/*#__PURE__*/
-__nccwpck_require__(47108);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xtake = /*#__PURE__*/__nccwpck_require__(51664);
+var slice = /*#__PURE__*/__nccwpck_require__(47108);
 /**
  * Returns the first `n` elements of the given list, string, or
  * transducer/transformer (or object with a `take` method).
@@ -32210,16 +27548,9 @@ __nccwpck_require__(47108);
  * @symb R.take(1, [a, b]) = [a]
  * @symb R.take(2, [a, b]) = [a, b]
  */
-
-
-var take =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable(['take'], _xtake, function take(n, xs) {
+var take = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable(['take'], _xtake, function take(n, xs) {
   return slice(0, n < 0 ? Infinity : n, xs);
 }));
-
 module.exports = take;
 
 /***/ }),
@@ -32227,13 +27558,8 @@ module.exports = take;
 /***/ 92816:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var drop =
-/*#__PURE__*/
-__nccwpck_require__(66769);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var drop = /*#__PURE__*/__nccwpck_require__(66769);
 /**
  * Returns a new list containing the last `n` elements of the given list.
  * If `n > list.length`, returns a list of `list.length` elements.
@@ -32256,14 +27582,9 @@ __nccwpck_require__(66769);
  *      R.takeLast(4, ['foo', 'bar', 'baz']); //=> ['foo', 'bar', 'baz']
  *      R.takeLast(3, 'ramda');               //=> 'mda'
  */
-
-
-var takeLast =
-/*#__PURE__*/
-_curry2(function takeLast(n, xs) {
+var takeLast = /*#__PURE__*/_curry2(function takeLast(n, xs) {
   return drop(n >= 0 ? xs.length - n : 0, xs);
 });
-
 module.exports = takeLast;
 
 /***/ }),
@@ -32271,13 +27592,8 @@ module.exports = takeLast;
 /***/ 9617:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var slice =
-/*#__PURE__*/
-__nccwpck_require__(47108);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var slice = /*#__PURE__*/__nccwpck_require__(47108);
 /**
  * Returns a new list containing the last `n` elements of a given list, passing
  * each value to the supplied predicate function, and terminating when the
@@ -32303,20 +27619,13 @@ __nccwpck_require__(47108);
  *
  *      R.takeLastWhile(x => x !== 'R' , 'Ramda'); //=> 'amda'
  */
-
-
-var takeLastWhile =
-/*#__PURE__*/
-_curry2(function takeLastWhile(fn, xs) {
+var takeLastWhile = /*#__PURE__*/_curry2(function takeLastWhile(fn, xs) {
   var idx = xs.length - 1;
-
   while (idx >= 0 && fn(xs[idx])) {
     idx -= 1;
   }
-
   return slice(idx + 1, Infinity, xs);
 });
-
 module.exports = takeLastWhile;
 
 /***/ }),
@@ -32324,21 +27633,10 @@ module.exports = takeLastWhile;
 /***/ 41973:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xtakeWhile =
-/*#__PURE__*/
-__nccwpck_require__(75265);
-
-var slice =
-/*#__PURE__*/
-__nccwpck_require__(47108);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xtakeWhile = /*#__PURE__*/__nccwpck_require__(75265);
+var slice = /*#__PURE__*/__nccwpck_require__(47108);
 /**
  * Returns a new list containing the first `n` elements of a given list,
  * passing each value to the supplied predicate function, and terminating when
@@ -32368,23 +27666,14 @@ __nccwpck_require__(47108);
  *
  *      R.takeWhile(x => x !== 'd' , 'Ramda'); //=> 'Ram'
  */
-
-
-var takeWhile =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable(['takeWhile'], _xtakeWhile, function takeWhile(fn, xs) {
+var takeWhile = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable(['takeWhile'], _xtakeWhile, function takeWhile(fn, xs) {
   var idx = 0;
   var len = xs.length;
-
   while (idx < len && fn(xs[idx])) {
     idx += 1;
   }
-
   return slice(0, idx, xs);
 }));
-
 module.exports = takeWhile;
 
 /***/ }),
@@ -32392,17 +27681,9 @@ module.exports = takeWhile;
 /***/ 51547:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xtap =
-/*#__PURE__*/
-__nccwpck_require__(73269);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xtap = /*#__PURE__*/__nccwpck_require__(73269);
 /**
  * Runs the given function with the supplied object, then returns the object.
  *
@@ -32423,17 +27704,10 @@ __nccwpck_require__(73269);
  *      // logs 'x is 100'
  * @symb R.tap(f, a) = (f(a), a)
  */
-
-
-var tap =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable([], _xtap, function tap(fn, x) {
+var tap = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable([], _xtap, function tap(fn, x) {
   fn(x);
   return x;
 }));
-
 module.exports = tap;
 
 /***/ }),
@@ -32441,21 +27715,10 @@ module.exports = tap;
 /***/ 39289:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _cloneRegExp =
-/*#__PURE__*/
-__nccwpck_require__(62621);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _isRegExp =
-/*#__PURE__*/
-__nccwpck_require__(22134);
-
-var toString =
-/*#__PURE__*/
-__nccwpck_require__(76119);
+var _cloneRegExp = /*#__PURE__*/__nccwpck_require__(62621);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _isRegExp = /*#__PURE__*/__nccwpck_require__(22134);
+var toString = /*#__PURE__*/__nccwpck_require__(76119);
 /**
  * Determines whether a given string matches a given regular expression.
  *
@@ -32473,18 +27736,12 @@ __nccwpck_require__(76119);
  *      R.test(/^x/, 'xyz'); //=> true
  *      R.test(/^y/, 'xyz'); //=> false
  */
-
-
-var test =
-/*#__PURE__*/
-_curry2(function test(pattern, str) {
+var test = /*#__PURE__*/_curry2(function test(pattern, str) {
   if (!_isRegExp(pattern)) {
     throw new TypeError('‘test’ requires a value of type RegExp as its first argument; received ' + toString(pattern));
   }
-
   return _cloneRegExp(pattern).test(str);
 });
-
 module.exports = test;
 
 /***/ }),
@@ -32492,13 +27749,8 @@ module.exports = test;
 /***/ 71615:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
-
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Creates a thunk out of a function. A thunk delays a calculation until
  * its result is needed, providing lazy evaluation of arguments.
@@ -32517,11 +27769,7 @@ __nccwpck_require__(60713);
  *      R.thunkify(R.identity)(42)(); //=> 42
  *      R.thunkify((a, b) => a + b)(25, 17)(); //=> 42
  */
-
-
-var thunkify =
-/*#__PURE__*/
-_curry1(function thunkify(fn) {
+var thunkify = /*#__PURE__*/_curry1(function thunkify(fn) {
   return curryN(fn.length, function createThunk() {
     var fnArgs = arguments;
     return function invokeThunk() {
@@ -32529,7 +27777,6 @@ _curry1(function thunkify(fn) {
     };
   });
 });
-
 module.exports = thunkify;
 
 /***/ }),
@@ -32537,9 +27784,7 @@ module.exports = thunkify;
 /***/ 72791:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Calls an input function `n` times, returning an array containing the results
  * of those function calls.
@@ -32563,29 +27808,19 @@ __nccwpck_require__(69483);
  * @symb R.times(f, 1) = [f(0)]
  * @symb R.times(f, 2) = [f(0), f(1)]
  */
-
-
-var times =
-/*#__PURE__*/
-_curry2(function times(fn, n) {
+var times = /*#__PURE__*/_curry2(function times(fn, n) {
   var len = Number(n);
-  var idx = 0;
-  var list;
-
   if (len < 0 || isNaN(len)) {
     throw new RangeError('n must be a non-negative number');
   }
-
-  list = [];
-
+  var idx = 0;
+  var list = Array(len);
   while (idx < len) {
-    list.push(fn(idx));
+    list[idx] = fn(idx);
     idx += 1;
   }
-
   return list;
 });
-
 module.exports = times;
 
 /***/ }),
@@ -32593,9 +27828,7 @@ module.exports = times;
 /***/ 11411:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var invoker =
-/*#__PURE__*/
-__nccwpck_require__(44910);
+var invoker = /*#__PURE__*/__nccwpck_require__(44910);
 /**
  * The lower case version of a string.
  *
@@ -32611,11 +27844,7 @@ __nccwpck_require__(44910);
  *
  *      R.toLower('XYZ'); //=> 'xyz'
  */
-
-
-var toLower =
-/*#__PURE__*/
-invoker(0, 'toLowerCase');
+var toLower = /*#__PURE__*/invoker(0, 'toLowerCase');
 module.exports = toLower;
 
 /***/ }),
@@ -32623,13 +27852,8 @@ module.exports = toLower;
 /***/ 74187:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var _has =
-/*#__PURE__*/
-__nccwpck_require__(41693);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _has = /*#__PURE__*/__nccwpck_require__(41693);
 /**
  * Converts an object into an array of key, value arrays. Only the object's
  * own properties are used.
@@ -32648,22 +27872,15 @@ __nccwpck_require__(41693);
  *
  *      R.toPairs({a: 1, b: 2, c: 3}); //=> [['a', 1], ['b', 2], ['c', 3]]
  */
-
-
-var toPairs =
-/*#__PURE__*/
-_curry1(function toPairs(obj) {
+var toPairs = /*#__PURE__*/_curry1(function toPairs(obj) {
   var pairs = [];
-
   for (var prop in obj) {
     if (_has(prop, obj)) {
       pairs[pairs.length] = [prop, obj[prop]];
     }
   }
-
   return pairs;
 });
-
 module.exports = toPairs;
 
 /***/ }),
@@ -32671,9 +27888,7 @@ module.exports = toPairs;
 /***/ 27578:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Converts an object into an array of key, value arrays. The object's own
  * properties and prototype properties are used. Note that the order of the
@@ -32695,20 +27910,13 @@ __nccwpck_require__(60713);
  *      const f = new F();
  *      R.toPairsIn(f); //=> [['x','X'], ['y','Y']]
  */
-
-
-var toPairsIn =
-/*#__PURE__*/
-_curry1(function toPairsIn(obj) {
+var toPairsIn = /*#__PURE__*/_curry1(function toPairsIn(obj) {
   var pairs = [];
-
   for (var prop in obj) {
     pairs[pairs.length] = [prop, obj[prop]];
   }
-
   return pairs;
 });
-
 module.exports = toPairsIn;
 
 /***/ }),
@@ -32716,13 +27924,8 @@ module.exports = toPairsIn;
 /***/ 76119:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var _toString =
-/*#__PURE__*/
-__nccwpck_require__(40165);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var _toString = /*#__PURE__*/__nccwpck_require__(40165);
 /**
  * Returns the string representation of the given value. `eval`'ing the output
  * should result in a value equivalent to the input value. Many of the built-in
@@ -32759,14 +27962,9 @@ __nccwpck_require__(40165);
  *      R.toString({foo: 1, bar: 2, baz: 3}); //=> '{"bar": 2, "baz": 3, "foo": 1}'
  *      R.toString(new Date('2001-02-03T04:05:06Z')); //=> 'new Date("2001-02-03T04:05:06.000Z")'
  */
-
-
-var toString =
-/*#__PURE__*/
-_curry1(function toString(val) {
+var toString = /*#__PURE__*/_curry1(function toString(val) {
   return _toString(val, []);
 });
-
 module.exports = toString;
 
 /***/ }),
@@ -32774,9 +27972,7 @@ module.exports = toString;
 /***/ 80382:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var invoker =
-/*#__PURE__*/
-__nccwpck_require__(44910);
+var invoker = /*#__PURE__*/__nccwpck_require__(44910);
 /**
  * The upper case version of a string.
  *
@@ -32792,11 +27988,7 @@ __nccwpck_require__(44910);
  *
  *      R.toUpper('abc'); //=> 'ABC'
  */
-
-
-var toUpper =
-/*#__PURE__*/
-invoker(0, 'toUpperCase');
+var toUpper = /*#__PURE__*/invoker(0, 'toUpperCase');
 module.exports = toUpper;
 
 /***/ }),
@@ -32804,17 +27996,9 @@ module.exports = toUpper;
 /***/ 71994:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _xReduce =
-/*#__PURE__*/
-__nccwpck_require__(60694);
-
-var _xwrap =
-/*#__PURE__*/
-__nccwpck_require__(97393);
-
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
+var _xReduce = /*#__PURE__*/__nccwpck_require__(60694);
+var _xwrap = /*#__PURE__*/__nccwpck_require__(97393);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
 /**
  * Initializes a transducer using supplied iterator function. Returns a single
  * item by iterating through the list, successively calling the transformed
@@ -32862,11 +28046,7 @@ __nccwpck_require__(61071);
  *      const firstOddTransducer = R.compose(R.filter(isOdd), R.take(1));
  *      R.transduce(firstOddTransducer, R.flip(R.append), [], R.range(0, 100)); //=> [1]
  */
-
-
-var transduce =
-/*#__PURE__*/
-curryN(4, function transduce(xf, fn, acc, list) {
+var transduce = /*#__PURE__*/curryN(4, function transduce(xf, fn, acc, list) {
   return _xReduce(xf(typeof fn === 'function' ? _xwrap(fn) : fn), acc, list);
 });
 module.exports = transduce;
@@ -32876,9 +28056,7 @@ module.exports = transduce;
 /***/ 81016:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Transposes the rows and columns of a 2D list.
  * When passed a list of `n` lists of length `x`,
@@ -32903,33 +28081,23 @@ __nccwpck_require__(60713);
  * @symb R.transpose([[a, b], [c, d]]) = [[a, c], [b, d]]
  * @symb R.transpose([[a, b], [c]]) = [[a, c], [b]]
  */
-
-
-var transpose =
-/*#__PURE__*/
-_curry1(function transpose(outerlist) {
+var transpose = /*#__PURE__*/_curry1(function transpose(outerlist) {
   var i = 0;
   var result = [];
-
   while (i < outerlist.length) {
     var innerlist = outerlist[i];
     var j = 0;
-
     while (j < innerlist.length) {
       if (typeof result[j] === 'undefined') {
         result[j] = [];
       }
-
       result[j].push(innerlist[j]);
       j += 1;
     }
-
     i += 1;
   }
-
   return result;
 });
-
 module.exports = transpose;
 
 /***/ }),
@@ -32937,17 +28105,9 @@ module.exports = transpose;
 /***/ 70949:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var map =
-/*#__PURE__*/
-__nccwpck_require__(28820);
-
-var sequence =
-/*#__PURE__*/
-__nccwpck_require__(44534);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var map = /*#__PURE__*/__nccwpck_require__(28820);
+var sequence = /*#__PURE__*/__nccwpck_require__(44534);
 /**
  * Maps an [Applicative](https://github.com/fantasyland/fantasy-land#applicative)-returning
  * function over a [Traversable](https://github.com/fantasyland/fantasy-land#traversable),
@@ -32981,18 +28141,13 @@ __nccwpck_require__(44534);
  *      R.traverse(Maybe, safeDiv(10), Right(0)); //=> Nothing
  *      R.traverse(Maybe, safeDiv(10), Left("X")); //=> Just(Left("X"))
  */
-
-
-var traverse =
-/*#__PURE__*/
-_curry3(function traverse(F, f, traversable) {
+var traverse = /*#__PURE__*/_curry3(function traverse(F, f, traversable) {
   var of = typeof F['fantasy-land/of'] === 'function' ? F['fantasy-land/of'] : typeof F.of === 'function' ? F.of : F;
   var TypeRep = {
     'fantasy-land/of': of
   };
   return typeof traversable['fantasy-land/traverse'] === 'function' ? traversable['fantasy-land/traverse'](TypeRep, f) : typeof traversable.traverse === 'function' ? traversable.traverse(TypeRep, f) : sequence(TypeRep, map(f, traversable));
 });
-
 module.exports = traverse;
 
 /***/ }),
@@ -33000,10 +28155,7 @@ module.exports = traverse;
 /***/ 73930:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 var ws = '\x09\x0A\x0B\x0C\x0D\x20\xA0\u1680\u2000\u2001\u2002\u2003' + '\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u202F\u205F\u3000\u2028' + '\u2029\uFEFF';
 var zeroWidth = '\u200b';
 var hasProtoTrim = typeof String.prototype.trim === 'function';
@@ -33022,20 +28174,11 @@ var hasProtoTrim = typeof String.prototype.trim === 'function';
  *      R.trim('   xyz  '); //=> 'xyz'
  *      R.map(R.trim, R.split(',', 'x, y, z')); //=> ['x', 'y', 'z']
  */
-
-var trim = !hasProtoTrim ||
-/*#__PURE__*/
-ws.trim() || !
-/*#__PURE__*/
-zeroWidth.trim() ?
-/*#__PURE__*/
-_curry1(function trim(str) {
+var trim = !hasProtoTrim || /*#__PURE__*/ws.trim() || ! /*#__PURE__*/zeroWidth.trim() ? /*#__PURE__*/_curry1(function trim(str) {
   var beginRx = new RegExp('^[' + ws + '][' + ws + ']*');
   var endRx = new RegExp('[' + ws + '][' + ws + ']*$');
   return str.replace(beginRx, '').replace(endRx, '');
-}) :
-/*#__PURE__*/
-_curry1(function trim(str) {
+}) : /*#__PURE__*/_curry1(function trim(str) {
   return str.trim();
 });
 module.exports = trim;
@@ -33045,17 +28188,9 @@ module.exports = trim;
 /***/ 45510:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _arity =
-/*#__PURE__*/
-__nccwpck_require__(31414);
-
-var _concat =
-/*#__PURE__*/
-__nccwpck_require__(68118);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _arity = /*#__PURE__*/__nccwpck_require__(31414);
+var _concat = /*#__PURE__*/__nccwpck_require__(68118);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * `tryCatch` takes two functions, a `tryer` and a `catcher`. The returned
  * function evaluates the `tryer`; if it does not throw, it simply returns the
@@ -33080,11 +28215,7 @@ __nccwpck_require__(69483);
  *      R.tryCatch(R.times(R.identity), R.always([]))('s') // => []
  *      R.tryCatch(() => { throw 'this is not a valid value'}, (err, value)=>({error : err,  value }))('bar') // => {'error': 'this is not a valid value', 'value': 'bar'}
  */
-
-
-var tryCatch =
-/*#__PURE__*/
-_curry2(function _tryCatch(tryer, catcher) {
+var tryCatch = /*#__PURE__*/_curry2(function _tryCatch(tryer, catcher) {
   return _arity(tryer.length, function () {
     try {
       return tryer.apply(this, arguments);
@@ -33093,7 +28224,6 @@ _curry2(function _tryCatch(tryer, catcher) {
     }
   });
 });
-
 module.exports = tryCatch;
 
 /***/ }),
@@ -33101,9 +28231,7 @@ module.exports = tryCatch;
 /***/ 41193:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Gives a single-word string description of the (native) type of a value,
  * returning such answers as 'Object', 'Number', 'Array', or 'Null'. Does not
@@ -33129,15 +28257,11 @@ __nccwpck_require__(60713);
  *      R.type(() => {}); //=> "Function"
  *      R.type(async () => {}); //=> "AsyncFunction"
  *      R.type(undefined); //=> "Undefined"
+ *      R.type(BigInt(123)); //=> "BigInt"
  */
-
-
-var type =
-/*#__PURE__*/
-_curry1(function type(val) {
+var type = /*#__PURE__*/_curry1(function type(val) {
   return val === null ? 'Null' : val === undefined ? 'Undefined' : Object.prototype.toString.call(val).slice(8, -1);
 });
-
 module.exports = type;
 
 /***/ }),
@@ -33145,9 +28269,7 @@ module.exports = type;
 /***/ 53162:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Takes a function `fn`, which takes a single array argument, and returns a
  * function which:
@@ -33172,16 +28294,11 @@ __nccwpck_require__(60713);
  *      R.unapply(JSON.stringify)(1, 2, 3); //=> '[1,2,3]'
  * @symb R.unapply(f)(a, b) = f([a, b])
  */
-
-
-var unapply =
-/*#__PURE__*/
-_curry1(function unapply(fn) {
+var unapply = /*#__PURE__*/_curry1(function unapply(fn) {
   return function () {
     return fn(Array.prototype.slice.call(arguments, 0));
   };
 });
-
 module.exports = unapply;
 
 /***/ }),
@@ -33189,13 +28306,8 @@ module.exports = unapply;
 /***/ 82749:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var nAry =
-/*#__PURE__*/
-__nccwpck_require__(82843);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var nAry = /*#__PURE__*/__nccwpck_require__(82843);
 /**
  * Wraps a function of any arity (including nullary) in a function that accepts
  * exactly 1 parameter. Any extraneous parameters will not be passed to the
@@ -33224,14 +28336,9 @@ __nccwpck_require__(82843);
  *      takesOneArg(1, 2); //=> [1, undefined]
  * @symb R.unary(f)(a, b, c) = f(a)
  */
-
-
-var unary =
-/*#__PURE__*/
-_curry1(function unary(fn) {
+var unary = /*#__PURE__*/_curry1(function unary(fn) {
   return nAry(1, fn);
 });
-
 module.exports = unary;
 
 /***/ }),
@@ -33239,13 +28346,8 @@ module.exports = unary;
 /***/ 60058:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
 /**
  * Returns a function of arity `n` from a (manually) curried function.
  * Note that, the returned function is actually a ramda style
@@ -33268,28 +28370,21 @@ __nccwpck_require__(61071);
  *      const uncurriedAddFour = R.uncurryN(4, addFour);
  *      uncurriedAddFour(1, 2, 3, 4); //=> 10
  */
-
-
-var uncurryN =
-/*#__PURE__*/
-_curry2(function uncurryN(depth, fn) {
+var uncurryN = /*#__PURE__*/_curry2(function uncurryN(depth, fn) {
   return curryN(depth, function () {
     var currentDepth = 1;
     var value = fn;
     var idx = 0;
     var endIdx;
-
     while (currentDepth <= depth && typeof value === 'function') {
       endIdx = currentDepth === depth ? arguments.length : idx + value.length;
       value = value.apply(this, Array.prototype.slice.call(arguments, idx, endIdx));
       currentDepth += 1;
       idx = endIdx;
     }
-
     return value;
   });
 });
-
 module.exports = uncurryN;
 
 /***/ }),
@@ -33297,9 +28392,7 @@ module.exports = uncurryN;
 /***/ 45739:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Builds a list from a seed value. Accepts an iterator function, which returns
  * either false to stop iteration or an array of length 2 containing the value
@@ -33325,22 +28418,15 @@ __nccwpck_require__(69483);
  *      R.unfold(f, 10); //=> [-10, -20, -30, -40, -50]
  * @symb R.unfold(f, x) = [f(x)[0], f(f(x)[1])[0], f(f(f(x)[1])[1])[0], ...]
  */
-
-
-var unfold =
-/*#__PURE__*/
-_curry2(function unfold(fn, seed) {
+var unfold = /*#__PURE__*/_curry2(function unfold(fn, seed) {
   var pair = fn(seed);
   var result = [];
-
   while (pair && pair.length) {
     result[result.length] = pair[0];
     pair = fn(pair[1]);
   }
-
   return result;
 });
-
 module.exports = unfold;
 
 /***/ }),
@@ -33348,21 +28434,10 @@ module.exports = unfold;
 /***/ 59550:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _concat =
-/*#__PURE__*/
-__nccwpck_require__(68118);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var compose =
-/*#__PURE__*/
-__nccwpck_require__(73651);
-
-var uniq =
-/*#__PURE__*/
-__nccwpck_require__(70272);
+var _concat = /*#__PURE__*/__nccwpck_require__(68118);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var compose = /*#__PURE__*/__nccwpck_require__(73651);
+var uniq = /*#__PURE__*/__nccwpck_require__(70272);
 /**
  * Combines two lists into a set (i.e. no duplicates) composed of the elements
  * of each list.
@@ -33380,14 +28455,7 @@ __nccwpck_require__(70272);
  *
  *      R.union([1, 2, 3], [2, 3, 4]); //=> [1, 2, 3, 4]
  */
-
-
-var union =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-compose(uniq, _concat));
-
+var union = /*#__PURE__*/_curry2( /*#__PURE__*/compose(uniq, _concat));
 module.exports = union;
 
 /***/ }),
@@ -33395,17 +28463,9 @@ module.exports = union;
 /***/ 33957:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _concat =
-/*#__PURE__*/
-__nccwpck_require__(68118);
-
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var uniqWith =
-/*#__PURE__*/
-__nccwpck_require__(96739);
+var _concat = /*#__PURE__*/__nccwpck_require__(68118);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var uniqWith = /*#__PURE__*/__nccwpck_require__(96739);
 /**
  * Combines two lists into a set (i.e. no duplicates) composed of the elements
  * of each list. Duplication is determined according to the value returned by
@@ -33429,14 +28489,9 @@ __nccwpck_require__(96739);
  *      const l2 = [{a: 1}, {a: 4}];
  *      R.unionWith(R.eqBy(R.prop('a')), l1, l2); //=> [{a: 1}, {a: 2}, {a: 4}]
  */
-
-
-var unionWith =
-/*#__PURE__*/
-_curry3(function unionWith(pred, list1, list2) {
+var unionWith = /*#__PURE__*/_curry3(function unionWith(pred, list1, list2) {
   return uniqWith(pred, _concat(list1, list2));
 });
-
 module.exports = unionWith;
 
 /***/ }),
@@ -33444,13 +28499,8 @@ module.exports = unionWith;
 /***/ 70272:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var identity =
-/*#__PURE__*/
-__nccwpck_require__(46304);
-
-var uniqBy =
-/*#__PURE__*/
-__nccwpck_require__(16076);
+var identity = /*#__PURE__*/__nccwpck_require__(46304);
+var uniqBy = /*#__PURE__*/__nccwpck_require__(16076);
 /**
  * Returns a new list containing only one copy of each element in the original
  * list. [`R.equals`](#equals) is used to determine equality.
@@ -33468,11 +28518,7 @@ __nccwpck_require__(16076);
  *      R.uniq([1, '1']);     //=> [1, '1']
  *      R.uniq([[42], [42]]); //=> [[42]]
  */
-
-
-var uniq =
-/*#__PURE__*/
-uniqBy(identity);
+var uniq = /*#__PURE__*/uniqBy(identity);
 module.exports = uniq;
 
 /***/ }),
@@ -33480,21 +28526,10 @@ module.exports = uniq;
 /***/ 16076:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _Set =
-/*#__PURE__*/
-__nccwpck_require__(71781);
-
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _xuniqBy =
-/*#__PURE__*/
-__nccwpck_require__(9931);
+var _Set = /*#__PURE__*/__nccwpck_require__(71781);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _xuniqBy = /*#__PURE__*/__nccwpck_require__(9931);
 /**
  * Returns a new list containing only one copy of each element in the original
  * list, based upon the value returned by applying the supplied function to
@@ -33515,32 +28550,21 @@ __nccwpck_require__(9931);
  *
  *      R.uniqBy(Math.abs, [-1, -5, 2, 10, 1, 2]); //=> [-1, -5, 2, 10]
  */
-
-
-var uniqBy =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable([], _xuniqBy, function (fn, list) {
+var uniqBy = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable([], _xuniqBy, function (fn, list) {
   var set = new _Set();
   var result = [];
   var idx = 0;
   var appliedItem, item;
-
   while (idx < list.length) {
     item = list[idx];
     appliedItem = fn(item);
-
     if (set.add(appliedItem)) {
       result.push(item);
     }
-
     idx += 1;
   }
-
   return result;
 }));
-
 module.exports = uniqBy;
 
 /***/ }),
@@ -33548,21 +28572,10 @@ module.exports = uniqBy;
 /***/ 96739:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _dispatchable =
-/*#__PURE__*/
-__nccwpck_require__(59699);
-
-var _includesWith =
-/*#__PURE__*/
-__nccwpck_require__(53968);
-
-var _xuniqWith =
-/*#__PURE__*/
-__nccwpck_require__(64902);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _dispatchable = /*#__PURE__*/__nccwpck_require__(59699);
+var _includesWith = /*#__PURE__*/__nccwpck_require__(53968);
+var _xuniqWith = /*#__PURE__*/__nccwpck_require__(64902);
 /**
  * Returns a new list containing only one copy of each element in the original
  * list, based upon the value returned by applying the supplied predicate to
@@ -33587,31 +28600,20 @@ __nccwpck_require__(64902);
  *      R.uniqWith(strEq)([1, '1', 1]);    //=> [1]
  *      R.uniqWith(strEq)(['1', 1, 1]);    //=> ['1']
  */
-
-
-var uniqWith =
-/*#__PURE__*/
-_curry2(
-/*#__PURE__*/
-_dispatchable([], _xuniqWith, function (pred, list) {
+var uniqWith = /*#__PURE__*/_curry2( /*#__PURE__*/_dispatchable([], _xuniqWith, function (pred, list) {
   var idx = 0;
   var len = list.length;
   var result = [];
   var item;
-
   while (idx < len) {
     item = list[idx];
-
     if (!_includesWith(pred, item, result)) {
       result[result.length] = item;
     }
-
     idx += 1;
   }
-
   return result;
 }));
-
 module.exports = uniqWith;
 
 /***/ }),
@@ -33619,9 +28621,7 @@ module.exports = uniqWith;
 /***/ 9300:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * Tests the final argument by passing it to the given predicate function. If
  * the predicate is not satisfied, the function will return the result of
@@ -33646,14 +28646,9 @@ __nccwpck_require__(37597);
  *      safeInc(null); //=> null
  *      safeInc(1); //=> 2
  */
-
-
-var unless =
-/*#__PURE__*/
-_curry3(function unless(pred, whenFalseFn, x) {
+var unless = /*#__PURE__*/_curry3(function unless(pred, whenFalseFn, x) {
   return pred(x) ? x : whenFalseFn(x);
 });
-
 module.exports = unless;
 
 /***/ }),
@@ -33661,13 +28656,8 @@ module.exports = unless;
 /***/ 65442:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _identity =
-/*#__PURE__*/
-__nccwpck_require__(44003);
-
-var chain =
-/*#__PURE__*/
-__nccwpck_require__(8210);
+var _identity = /*#__PURE__*/__nccwpck_require__(44003);
+var chain = /*#__PURE__*/__nccwpck_require__(8210);
 /**
  * Shorthand for `R.chain(R.identity)`, which removes one level of nesting from
  * any [Chain](https://github.com/fantasyland/fantasy-land#chain).
@@ -33685,11 +28675,7 @@ __nccwpck_require__(8210);
  *      R.unnest([1, [2], [[3]]]); //=> [1, 2, [3]]
  *      R.unnest([[1, 2], [3, 4], [5, 6]]); //=> [1, 2, 3, 4, 5, 6]
  */
-
-
-var unnest =
-/*#__PURE__*/
-chain(_identity);
+var unnest = /*#__PURE__*/chain(_identity);
 module.exports = unnest;
 
 /***/ }),
@@ -33697,9 +28683,7 @@ module.exports = unnest;
 /***/ 80135:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * Takes a predicate, a transformation function, and an initial value,
  * and returns a value of the same type as the initial value.
@@ -33719,20 +28703,13 @@ __nccwpck_require__(37597);
  *
  *      R.until(R.gt(R.__, 100), R.multiply(2))(1) // => 128
  */
-
-
-var until =
-/*#__PURE__*/
-_curry3(function until(pred, fn, init) {
+var until = /*#__PURE__*/_curry3(function until(pred, fn, init) {
   var val = init;
-
   while (!pred(val)) {
     val = fn(val);
   }
-
   return val;
 });
-
 module.exports = until;
 
 /***/ }),
@@ -33740,21 +28717,10 @@ module.exports = until;
 /***/ 11594:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _isArray =
-/*#__PURE__*/
-__nccwpck_require__(56999);
-
-var _map =
-/*#__PURE__*/
-__nccwpck_require__(38077);
-
-var _assoc =
-/*#__PURE__*/
-__nccwpck_require__(84702);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _isArray = /*#__PURE__*/__nccwpck_require__(56999);
+var _map = /*#__PURE__*/__nccwpck_require__(38077);
+var _assoc = /*#__PURE__*/__nccwpck_require__(84702);
 /**
  *
  * Deconstructs an array field from the input documents to output a document for each element.
@@ -33765,9 +28731,9 @@ __nccwpck_require__(84702);
  * @since v0.28.0
  * @category Object
  * @sig String -> {k: [v]} -> [{k: v}]
- * @param {String} key The key to determine which property of the object should be unwind
- * @param {Object} object The object containing list under property named as key which is to unwind
- * @return {List} A new list of object containing the value of input key having list replaced by each element in the object.
+ * @param {String} key The key to determine which property of the object should be unwound.
+ * @param {Object} object The object containing the list to unwind at the property named by the key.
+ * @return {List} A list of new objects, each having the given key associated to an item from the unwound list.
  * @example
  *
  * R.unwind('hobbies', {
@@ -33780,22 +28746,16 @@ __nccwpck_require__(84702);
  * //   { name: 'alice', hobbies: 'Hacking', colors: ['red', 'green'] }
  * // ]
  */
-
-
-var unwind =
-/*#__PURE__*/
-_curry2(function (key, object) {
+var unwind = /*#__PURE__*/_curry2(function (key, object) {
   // If key is not in object or key is not as a list in object
   if (!(key in object && _isArray(object[key]))) {
     return [object];
-  } // Map over object[key] which is a list and assoc each element with key
-
-
+  }
+  // Map over object[key] which is a list and assoc each element with key
   return _map(function (item) {
     return _assoc(key, item, object);
   }, object[key]);
 });
-
 module.exports = unwind;
 
 /***/ }),
@@ -33803,17 +28763,9 @@ module.exports = unwind;
 /***/ 70129:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
-
-var adjust =
-/*#__PURE__*/
-__nccwpck_require__(50743);
-
-var always =
-/*#__PURE__*/
-__nccwpck_require__(37770);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
+var adjust = /*#__PURE__*/__nccwpck_require__(50743);
+var always = /*#__PURE__*/__nccwpck_require__(37770);
 /**
  * Returns a new copy of the array with the element at the provided index
  * replaced with the given value.
@@ -33836,14 +28788,9 @@ __nccwpck_require__(37770);
  * @symb R.update(0, a, [b, c]) = [a, c]
  * @symb R.update(1, a, [b, c]) = [b, a]
  */
-
-
-var update =
-/*#__PURE__*/
-_curry3(function update(idx, x, list) {
+var update = /*#__PURE__*/_curry3(function update(idx, x, list) {
   return adjust(idx, always(x), list);
 });
-
 module.exports = update;
 
 /***/ }),
@@ -33851,13 +28798,8 @@ module.exports = update;
 /***/ 36487:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var curryN =
-/*#__PURE__*/
-__nccwpck_require__(61071);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var curryN = /*#__PURE__*/__nccwpck_require__(61071);
 /**
  * Accepts a function `fn` and a list of transformer functions and returns a
  * new curried function. When the new function is invoked, it calls the
@@ -33887,24 +28829,17 @@ __nccwpck_require__(61071);
  *      R.useWith(Math.pow, [R.dec, R.inc])(3)(4); //=> 32
  * @symb R.useWith(f, [g, h])(a, b) = f(g(a), h(b))
  */
-
-
-var useWith =
-/*#__PURE__*/
-_curry2(function useWith(fn, transformers) {
+var useWith = /*#__PURE__*/_curry2(function useWith(fn, transformers) {
   return curryN(transformers.length, function () {
     var args = [];
     var idx = 0;
-
     while (idx < transformers.length) {
       args.push(transformers[idx].call(this, arguments[idx]));
       idx += 1;
     }
-
     return fn.apply(this, args.concat(Array.prototype.slice.call(arguments, transformers.length)));
   });
 });
-
 module.exports = useWith;
 
 /***/ }),
@@ -33912,13 +28847,8 @@ module.exports = useWith;
 /***/ 6410:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
-
-var keys =
-/*#__PURE__*/
-__nccwpck_require__(96755);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
+var keys = /*#__PURE__*/__nccwpck_require__(96755);
 /**
  * Returns a list of all the enumerable own properties of the supplied object.
  * Note that the order of the output array is not guaranteed across different
@@ -33936,24 +28866,17 @@ __nccwpck_require__(96755);
  *
  *      R.values({a: 1, b: 2, c: 3}); //=> [1, 2, 3]
  */
-
-
-var values =
-/*#__PURE__*/
-_curry1(function values(obj) {
+var values = /*#__PURE__*/_curry1(function values(obj) {
   var props = keys(obj);
   var len = props.length;
   var vals = [];
   var idx = 0;
-
   while (idx < len) {
     vals[idx] = obj[props[idx]];
     idx += 1;
   }
-
   return vals;
 });
-
 module.exports = values;
 
 /***/ }),
@@ -33961,9 +28884,7 @@ module.exports = values;
 /***/ 22168:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry1 =
-/*#__PURE__*/
-__nccwpck_require__(60713);
+var _curry1 = /*#__PURE__*/__nccwpck_require__(60713);
 /**
  * Returns a list of all the properties, including prototype properties, of the
  * supplied object.
@@ -33985,21 +28906,14 @@ __nccwpck_require__(60713);
  *      const f = new F();
  *      R.valuesIn(f); //=> ['X', 'Y']
  */
-
-
-var valuesIn =
-/*#__PURE__*/
-_curry1(function valuesIn(obj) {
+var valuesIn = /*#__PURE__*/_curry1(function valuesIn(obj) {
   var prop;
   var vs = [];
-
   for (prop in obj) {
     vs[vs.length] = obj[prop];
   }
-
   return vs;
 });
-
 module.exports = valuesIn;
 
 /***/ }),
@@ -34007,11 +28921,7 @@ module.exports = valuesIn;
 /***/ 13288:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483); // `Const` is a functor that effectively ignores the function given to `map`.
-
-
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483); // `Const` is a functor that effectively ignores the function given to `map`.
 var Const = function (x) {
   return {
     value: x,
@@ -34020,6 +28930,7 @@ var Const = function (x) {
     }
   };
 };
+
 /**
  * Returns a "view" of the given data structure, determined by the given lens.
  * The lens's focus determines which portion of the data structure is visible.
@@ -34041,16 +28952,11 @@ var Const = function (x) {
  *      R.view(xLens, {x: 1, y: 2});  //=> 1
  *      R.view(xLens, {x: 4, y: 2});  //=> 4
  */
-
-
-var view =
-/*#__PURE__*/
-_curry2(function view(lens, x) {
+var view = /*#__PURE__*/_curry2(function view(lens, x) {
   // Using `Const` effectively ignores the setter function of the `lens`,
   // leaving the value returned by the getter function unmodified.
   return lens(Const)(x).value;
 });
-
 module.exports = view;
 
 /***/ }),
@@ -34058,9 +28964,7 @@ module.exports = view;
 /***/ 42531:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * Tests the final argument by passing it to the given predicate function. If
  * the predicate is satisfied, the function will return the result of calling
@@ -34089,14 +28993,9 @@ __nccwpck_require__(37597);
  *      truncate('12345');         //=> '12345'
  *      truncate('0123456789ABC'); //=> '0123456789…'
  */
-
-
-var when =
-/*#__PURE__*/
-_curry3(function when(pred, whenTrueFn, x) {
+var when = /*#__PURE__*/_curry3(function when(pred, whenTrueFn, x) {
   return pred(x) ? whenTrueFn(x) : x;
 });
-
 module.exports = when;
 
 /***/ }),
@@ -34104,13 +29003,8 @@ module.exports = when;
 /***/ 55060:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _has =
-/*#__PURE__*/
-__nccwpck_require__(41693);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _has = /*#__PURE__*/__nccwpck_require__(41693);
 /**
  * Takes a spec object and a test object; returns true if the test satisfies
  * the spec. Each of the spec's own properties must be a predicate function.
@@ -34146,20 +29040,14 @@ __nccwpck_require__(41693);
  *      pred({a: 'foo', b: 'xxx', x: 10, y: 19}); //=> false
  *      pred({a: 'foo', b: 'xxx', x: 11, y: 20}); //=> false
  */
-
-
-var where =
-/*#__PURE__*/
-_curry2(function where(spec, testObj) {
+var where = /*#__PURE__*/_curry2(function where(spec, testObj) {
   for (var prop in spec) {
     if (_has(prop, spec) && !spec[prop](testObj[prop])) {
       return false;
     }
   }
-
   return true;
 });
-
 module.exports = where;
 
 /***/ }),
@@ -34167,13 +29055,8 @@ module.exports = where;
 /***/ 53811:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _has =
-/*#__PURE__*/
-__nccwpck_require__(41693);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _has = /*#__PURE__*/__nccwpck_require__(41693);
 /**
  * Takes a spec object and a test object; each of the spec's own properties must be a predicate function.
  * Each predicate is applied to the value of the corresponding property of the
@@ -34208,20 +29091,14 @@ __nccwpck_require__(41693);
  *      pred({a: 'foo', b: 'bar', x: 10, y: 20}); //=> true
  *      pred({a: 'foo', b: 'xxx', x: 11, y: 20}); //=> true
  */
-
-
-var whereAny =
-/*#__PURE__*/
-_curry2(function whereAny(spec, testObj) {
+var whereAny = /*#__PURE__*/_curry2(function whereAny(spec, testObj) {
   for (var prop in spec) {
     if (_has(prop, spec) && spec[prop](testObj[prop])) {
       return true;
     }
   }
-
   return false;
 });
-
 module.exports = whereAny;
 
 /***/ }),
@@ -34229,21 +29106,10 @@ module.exports = whereAny;
 /***/ 40255:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var equals =
-/*#__PURE__*/
-__nccwpck_require__(50548);
-
-var map =
-/*#__PURE__*/
-__nccwpck_require__(28820);
-
-var where =
-/*#__PURE__*/
-__nccwpck_require__(55060);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var equals = /*#__PURE__*/__nccwpck_require__(50548);
+var map = /*#__PURE__*/__nccwpck_require__(28820);
+var where = /*#__PURE__*/__nccwpck_require__(55060);
 /**
  * Takes a spec object and a test object; returns true if the test satisfies
  * the spec, false otherwise. An object satisfies the spec if, for each of the
@@ -34272,14 +29138,9 @@ __nccwpck_require__(55060);
  *      pred({a: 1, b: 2, c: 3});  //=> true
  *      pred({a: 1, b: 1});        //=> false
  */
-
-
-var whereEq =
-/*#__PURE__*/
-_curry2(function whereEq(spec, testObj) {
+var whereEq = /*#__PURE__*/_curry2(function whereEq(spec, testObj) {
   return where(map(equals, spec), testObj);
 });
-
 module.exports = whereEq;
 
 /***/ }),
@@ -34287,17 +29148,9 @@ module.exports = whereEq;
 /***/ 52274:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
-
-var _Set =
-/*#__PURE__*/
-__nccwpck_require__(71781);
-
-var reject =
-/*#__PURE__*/
-__nccwpck_require__(71545);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
+var _Set = /*#__PURE__*/__nccwpck_require__(71781);
+var reject = /*#__PURE__*/__nccwpck_require__(71545);
 /**
  * Returns a new list without values in the first argument.
  * [`R.equals`](#equals) is used to determine equality.
@@ -34317,20 +29170,13 @@ __nccwpck_require__(71545);
  *
  *      R.without([1, 2], [1, 2, 1, 3, 4]); //=> [3, 4]
  */
-
-
-var without =
-/*#__PURE__*/
-_curry2(function without(xs, list) {
+var without = /*#__PURE__*/_curry2(function without(xs, list) {
   var toRemove = new _Set();
-
   for (var i = 0; i < xs.length; i += 1) {
     toRemove.add(xs[i]);
   }
-
   return reject(toRemove.has.bind(toRemove), list);
 });
-
 module.exports = without;
 
 /***/ }),
@@ -34338,9 +29184,7 @@ module.exports = without;
 /***/ 90219:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Exclusive disjunction logical operation.
  * Returns `true` if one of the arguments is truthy and the other is falsy.
@@ -34362,14 +29206,9 @@ __nccwpck_require__(69483);
  *      R.xor(false, true); //=> true
  *      R.xor(false, false); //=> false
  */
-
-
-var xor =
-/*#__PURE__*/
-_curry2(function xor(a, b) {
+var xor = /*#__PURE__*/_curry2(function xor(a, b) {
   return Boolean(!a ^ !b);
 });
-
 module.exports = xor;
 
 /***/ }),
@@ -34377,9 +29216,7 @@ module.exports = xor;
 /***/ 82718:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Creates a new list out of the two supplied by creating each possible pair
  * from the lists.
@@ -34398,32 +29235,23 @@ __nccwpck_require__(69483);
  *      R.xprod([1, 2], ['a', 'b']); //=> [[1, 'a'], [1, 'b'], [2, 'a'], [2, 'b']]
  * @symb R.xprod([a, b], [c, d]) = [[a, c], [a, d], [b, c], [b, d]]
  */
-
-
-var xprod =
-/*#__PURE__*/
-_curry2(function xprod(a, b) {
+var xprod = /*#__PURE__*/_curry2(function xprod(a, b) {
   // = xprodWith(prepend); (takes about 3 times as long...)
-  var idx = 0;
+  var i = 0;
   var ilen = a.length;
   var j;
   var jlen = b.length;
-  var result = [];
-
-  while (idx < ilen) {
+  var result = Array(ilen * jlen);
+  while (i < ilen) {
     j = 0;
-
     while (j < jlen) {
-      result[result.length] = [a[idx], b[j]];
+      result[i * jlen + j] = [a[i], b[j]];
       j += 1;
     }
-
-    idx += 1;
+    i += 1;
   }
-
   return result;
 });
-
 module.exports = xprod;
 
 /***/ }),
@@ -34431,9 +29259,7 @@ module.exports = xprod;
 /***/ 59024:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Creates a new list out of the two supplied by pairing up equally-positioned
  * items from both lists. The returned list is truncated to the length of the
@@ -34453,23 +29279,16 @@ __nccwpck_require__(69483);
  *      R.zip([1, 2, 3], ['a', 'b', 'c']); //=> [[1, 'a'], [2, 'b'], [3, 'c']]
  * @symb R.zip([a, b, c], [d, e, f]) = [[a, d], [b, e], [c, f]]
  */
-
-
-var zip =
-/*#__PURE__*/
-_curry2(function zip(a, b) {
-  var rv = [];
-  var idx = 0;
+var zip = /*#__PURE__*/_curry2(function zip(a, b) {
   var len = Math.min(a.length, b.length);
-
+  var rv = Array(len);
+  var idx = 0;
   while (idx < len) {
     rv[idx] = [a[idx], b[idx]];
     idx += 1;
   }
-
   return rv;
 });
-
 module.exports = zip;
 
 /***/ }),
@@ -34477,9 +29296,7 @@ module.exports = zip;
 /***/ 12902:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry2 =
-/*#__PURE__*/
-__nccwpck_require__(69483);
+var _curry2 = /*#__PURE__*/__nccwpck_require__(69483);
 /**
  * Creates a new object out of a list of keys and a list of values.
  * Key/value pairing is truncated to the length of the shorter of the two lists.
@@ -34497,23 +29314,16 @@ __nccwpck_require__(69483);
  *
  *      R.zipObj(['a', 'b', 'c'], [1, 2, 3]); //=> {a: 1, b: 2, c: 3}
  */
-
-
-var zipObj =
-/*#__PURE__*/
-_curry2(function zipObj(keys, values) {
+var zipObj = /*#__PURE__*/_curry2(function zipObj(keys, values) {
   var idx = 0;
   var len = Math.min(keys.length, values.length);
   var out = {};
-
   while (idx < len) {
     out[keys[idx]] = values[idx];
     idx += 1;
   }
-
   return out;
 });
-
 module.exports = zipObj;
 
 /***/ }),
@@ -34521,9 +29331,7 @@ module.exports = zipObj;
 /***/ 31104:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-var _curry3 =
-/*#__PURE__*/
-__nccwpck_require__(37597);
+var _curry3 = /*#__PURE__*/__nccwpck_require__(37597);
 /**
  * Creates a new list out of the two supplied by applying the function to each
  * equally-positioned pair in the lists. The returned list is truncated to the
@@ -34548,23 +29356,16 @@ __nccwpck_require__(37597);
  *      //=> [f(1, 'a'), f(2, 'b'), f(3, 'c')]
  * @symb R.zipWith(fn, [a, b, c], [d, e, f]) = [fn(a, d), fn(b, e), fn(c, f)]
  */
-
-
-var zipWith =
-/*#__PURE__*/
-_curry3(function zipWith(fn, a, b) {
-  var rv = [];
-  var idx = 0;
+var zipWith = /*#__PURE__*/_curry3(function zipWith(fn, a, b) {
   var len = Math.min(a.length, b.length);
-
+  var rv = Array(len);
+  var idx = 0;
   while (idx < len) {
     rv[idx] = fn(a[idx], b[idx]);
     idx += 1;
   }
-
   return rv;
 });
-
 module.exports = zipWith;
 
 /***/ }),
@@ -35001,6 +29802,7 @@ const MockAgent = __nccwpck_require__(66771)
 const MockPool = __nccwpck_require__(26193)
 const mockErrors = __nccwpck_require__(50888)
 const ProxyAgent = __nccwpck_require__(97858)
+const RetryHandler = __nccwpck_require__(82286)
 const { getGlobalDispatcher, setGlobalDispatcher } = __nccwpck_require__(21892)
 const DecoratorHandler = __nccwpck_require__(46930)
 const RedirectHandler = __nccwpck_require__(72860)
@@ -35022,6 +29824,7 @@ module.exports.Pool = Pool
 module.exports.BalancedPool = BalancedPool
 module.exports.Agent = Agent
 module.exports.ProxyAgent = ProxyAgent
+module.exports.RetryHandler = RetryHandler
 
 module.exports.DecoratorHandler = DecoratorHandler
 module.exports.RedirectHandler = RedirectHandler
@@ -35922,6 +30725,7 @@ function request (opts, callback) {
 }
 
 module.exports = request
+module.exports.RequestHandler = RequestHandler
 
 
 /***/ }),
@@ -36036,6 +30840,10 @@ class StreamHandler extends AsyncResource {
         { callback, body: res, contentType, statusCode, statusMessage, headers }
       )
     } else {
+      if (factory === null) {
+        return
+      }
+
       res = this.runInAsyncScope(factory, null, {
         statusCode,
         headers,
@@ -36084,13 +30892,17 @@ class StreamHandler extends AsyncResource {
   onData (chunk) {
     const { res } = this
 
-    return res.write(chunk)
+    return res ? res.write(chunk) : true
   }
 
   onComplete (trailers) {
     const { res } = this
 
     removeSignal(this)
+
+    if (!res) {
+      return
+    }
 
     this.trailers = util.parseHeaders(trailers)
 
@@ -36296,6 +31108,8 @@ const kBody = Symbol('kBody')
 const kAbort = Symbol('abort')
 const kContentType = Symbol('kContentType')
 
+const noop = () => {}
+
 module.exports = class BodyReadable extends Readable {
   constructor ({
     resume,
@@ -36429,37 +31243,50 @@ module.exports = class BodyReadable extends Readable {
     return this[kBody]
   }
 
-  async dump (opts) {
+  dump (opts) {
     let limit = opts && Number.isFinite(opts.limit) ? opts.limit : 262144
     const signal = opts && opts.signal
-    const abortFn = () => {
-      this.destroy()
-    }
-    let signalListenerCleanup
+
     if (signal) {
-      if (typeof signal !== 'object' || !('aborted' in signal)) {
-        throw new InvalidArgumentError('signal must be an AbortSignal')
-      }
-      util.throwIfAborted(signal)
-      signalListenerCleanup = util.addAbortListener(signal, abortFn)
-    }
-    try {
-      for await (const chunk of this) {
-        util.throwIfAborted(signal)
-        limit -= Buffer.byteLength(chunk)
-        if (limit < 0) {
-          return
+      try {
+        if (typeof signal !== 'object' || !('aborted' in signal)) {
+          throw new InvalidArgumentError('signal must be an AbortSignal')
         }
-      }
-    } catch {
-      util.throwIfAborted(signal)
-    } finally {
-      if (typeof signalListenerCleanup === 'function') {
-        signalListenerCleanup()
-      } else if (signalListenerCleanup) {
-        signalListenerCleanup[Symbol.dispose]()
+        util.throwIfAborted(signal)
+      } catch (err) {
+        return Promise.reject(err)
       }
     }
+
+    if (this.closed) {
+      return Promise.resolve(null)
+    }
+
+    return new Promise((resolve, reject) => {
+      const signalListenerCleanup = signal
+        ? util.addAbortListener(signal, () => {
+          this.destroy()
+        })
+        : noop
+
+      this
+        .on('close', function () {
+          signalListenerCleanup()
+          if (signal && signal.aborted) {
+            reject(signal.reason || Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }))
+          } else {
+            resolve(null)
+          }
+        })
+        .on('error', noop)
+        .on('data', function (chunk) {
+          limit -= chunk.length
+          if (limit <= 0) {
+            this.destroy()
+          }
+        })
+        .resume()
+    })
   }
 }
 
@@ -36548,7 +31375,7 @@ function consumeEnd (consume) {
         pos += buf.byteLength
       }
 
-      resolve(dst)
+      resolve(dst.buffer)
     } else if (type === 'blob') {
       if (!Blob) {
         Blob = (__nccwpck_require__(14300).Blob)
@@ -37839,13 +32666,13 @@ module.exports = {
 /***/ }),
 
 /***/ 29174:
-/***/ ((module) => {
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 "use strict";
 
 
 module.exports = {
-  kConstruct: Symbol('constructable')
+  kConstruct: (__nccwpck_require__(72785).kConstruct)
 }
 
 
@@ -38831,11 +33658,9 @@ class Parser {
       socket[kReset] = true
     }
 
-    let pause
-    try {
-      pause = request.onHeaders(statusCode, headers, this.resume, statusText) === false
-    } catch (err) {
-      util.destroy(socket, err)
+    const pause = request.onHeaders(statusCode, headers, this.resume, statusText) === false
+
+    if (request.aborted) {
       return -1
     }
 
@@ -38882,13 +33707,8 @@ class Parser {
 
     this.bytesRead += buf.length
 
-    try {
-      if (request.onData(buf) === false) {
-        return constants.ERROR.PAUSED
-      }
-    } catch (err) {
-      util.destroy(socket, err)
-      return -1
+    if (request.onData(buf) === false) {
+      return constants.ERROR.PAUSED
     }
   }
 
@@ -38929,11 +33749,7 @@ class Parser {
       return -1
     }
 
-    try {
-      request.onComplete(headers)
-    } catch (err) {
-      errorRequest(client, request, err)
-    }
+    request.onComplete(headers)
 
     client[kQueue][client[kRunningIdx]++] = null
 
@@ -38984,7 +33800,9 @@ function onParserTimeout (parser) {
 
 function onSocketReadable () {
   const { [kParser]: parser } = this
-  parser.readMore()
+  if (parser) {
+    parser.readMore()
+  }
 }
 
 function onSocketError (err) {
@@ -39095,7 +33913,7 @@ async function connect (client) {
     const idx = hostname.indexOf(']')
 
     assert(idx !== -1)
-    const ip = hostname.substr(1, idx - 1)
+    const ip = hostname.substring(1, idx)
 
     assert(net.isIP(ip))
     hostname = ip
@@ -39374,23 +34192,7 @@ function _resume (client, sync) {
       return
     }
 
-    if (util.isStream(request.body) && util.bodyLength(request.body) === 0) {
-      request.body
-        .on('data', /* istanbul ignore next */ function () {
-          /* istanbul ignore next */
-          assert(false)
-        })
-        .on('error', function (err) {
-          errorRequest(client, request, err)
-        })
-        .on('end', function () {
-          util.destroy(this)
-        })
-
-      request.body = null
-    }
-
-    if (client[kRunning] > 0 &&
+    if (client[kRunning] > 0 && util.bodyLength(request.body) !== 0 &&
       (util.isStream(request.body) || util.isAsyncIterable(request.body))) {
       // Request with stream or iterator body can error while other requests
       // are inflight and indirectly error those as well.
@@ -39409,6 +34211,11 @@ function _resume (client, sync) {
       client[kQueue].splice(client[kPendingIdx], 1)
     }
   }
+}
+
+// https://www.rfc-editor.org/rfc/rfc7230#section-3.3.2
+function shouldSendContentLength (method) {
+  return method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS' && method !== 'TRACE' && method !== 'CONNECT'
 }
 
 function write (client, request) {
@@ -39439,7 +34246,9 @@ function write (client, request) {
     body.read(0)
   }
 
-  let contentLength = util.bodyLength(body)
+  const bodyLength = util.bodyLength(body)
+
+  let contentLength = bodyLength
 
   if (contentLength === null) {
     contentLength = request.contentLength
@@ -39454,7 +34263,9 @@ function write (client, request) {
     contentLength = null
   }
 
-  if (request.contentLength !== null && request.contentLength !== contentLength) {
+  // https://github.com/nodejs/undici/issues/2046
+  // A user agent may send a Content-Length header with 0 value, this should be allowed.
+  if (shouldSendContentLength(method) && contentLength > 0 && request.contentLength !== null && request.contentLength !== contentLength) {
     if (client[kStrictContentLength]) {
       errorRequest(client, request, new RequestContentLengthMismatchError())
       return false
@@ -39535,7 +34346,7 @@ function write (client, request) {
   }
 
   /* istanbul ignore else: assertion */
-  if (!body) {
+  if (!body || bodyLength === 0) {
     if (contentLength === 0) {
       socket.write(`${header}content-length: 0\r\n\r\n`, 'latin1')
     } else {
@@ -39601,6 +34412,7 @@ function writeH2 (client, session, request) {
     return false
   }
 
+  /** @type {import('node:http2').ClientHttp2Stream} */
   let stream
   const h2State = client[kHTTP2SessionState]
 
@@ -39675,7 +34487,9 @@ function writeH2 (client, session, request) {
     contentLength = null
   }
 
-  if (request.contentLength != null && request.contentLength !== contentLength) {
+  // https://github.com/nodejs/undici/issues/2046
+  // A user agent may send a Content-Length header with 0 value, this should be allowed.
+  if (shouldSendContentLength(method) && contentLength > 0 && request.contentLength != null && request.contentLength !== contentLength) {
     if (client[kStrictContentLength]) {
       errorRequest(client, request, new RequestContentLengthMismatchError())
       return false
@@ -39694,14 +34508,10 @@ function writeH2 (client, session, request) {
   const shouldEndStream = method === 'GET' || method === 'HEAD'
   if (expectContinue) {
     headers[HTTP2_HEADER_EXPECT] = '100-continue'
-    /**
-     * @type {import('node:http2').ClientHttp2Stream}
-     */
     stream = session.request(headers, { endStream: shouldEndStream, signal })
 
     stream.once('continue', writeBodyH2)
   } else {
-    /** @type {import('node:http2').ClientHttp2Stream} */
     stream = session.request(headers, {
       endStream: shouldEndStream,
       signal
@@ -39713,7 +34523,9 @@ function writeH2 (client, session, request) {
   ++h2State.openStreams
 
   stream.once('response', headers => {
-    if (request.onHeaders(Number(headers[HTTP2_HEADER_STATUS]), headers, stream.resume.bind(stream), '') === false) {
+    const { [HTTP2_HEADER_STATUS]: statusCode, ...realHeaders } = headers
+
+    if (request.onHeaders(Number(statusCode), realHeaders, stream.resume.bind(stream), '') === false) {
       stream.pause()
     }
   })
@@ -39723,13 +34535,17 @@ function writeH2 (client, session, request) {
   })
 
   stream.on('data', (chunk) => {
-    if (request.onData(chunk) === false) stream.pause()
+    if (request.onData(chunk) === false) {
+      stream.pause()
+    }
   })
 
   stream.once('close', () => {
     h2State.openStreams -= 1
     // TODO(HTTP/2): unref only if current streams count is 0
-    if (h2State.openStreams === 0) session.unref()
+    if (h2State.openStreams === 0) {
+      session.unref()
+    }
   })
 
   stream.once('error', function (err) {
@@ -39889,7 +34705,11 @@ function writeStream ({ h2stream, body, client, request, socket, contentLength, 
     }
   }
   const onAbort = function () {
-    onFinished(new RequestAbortedError())
+    if (finished) {
+      return
+    }
+    const err = new RequestAbortedError()
+    queueMicrotask(() => onFinished(err))
   }
   const onFinished = function (err) {
     if (finished) {
@@ -41295,6 +36115,132 @@ module.exports = buildConnector
 
 /***/ }),
 
+/***/ 14462:
+/***/ ((module) => {
+
+"use strict";
+
+
+/** @type {Record<string, string | undefined>} */
+const headerNameLowerCasedRecord = {}
+
+// https://developer.mozilla.org/docs/Web/HTTP/Headers
+const wellknownHeaderNames = [
+  'Accept',
+  'Accept-Encoding',
+  'Accept-Language',
+  'Accept-Ranges',
+  'Access-Control-Allow-Credentials',
+  'Access-Control-Allow-Headers',
+  'Access-Control-Allow-Methods',
+  'Access-Control-Allow-Origin',
+  'Access-Control-Expose-Headers',
+  'Access-Control-Max-Age',
+  'Access-Control-Request-Headers',
+  'Access-Control-Request-Method',
+  'Age',
+  'Allow',
+  'Alt-Svc',
+  'Alt-Used',
+  'Authorization',
+  'Cache-Control',
+  'Clear-Site-Data',
+  'Connection',
+  'Content-Disposition',
+  'Content-Encoding',
+  'Content-Language',
+  'Content-Length',
+  'Content-Location',
+  'Content-Range',
+  'Content-Security-Policy',
+  'Content-Security-Policy-Report-Only',
+  'Content-Type',
+  'Cookie',
+  'Cross-Origin-Embedder-Policy',
+  'Cross-Origin-Opener-Policy',
+  'Cross-Origin-Resource-Policy',
+  'Date',
+  'Device-Memory',
+  'Downlink',
+  'ECT',
+  'ETag',
+  'Expect',
+  'Expect-CT',
+  'Expires',
+  'Forwarded',
+  'From',
+  'Host',
+  'If-Match',
+  'If-Modified-Since',
+  'If-None-Match',
+  'If-Range',
+  'If-Unmodified-Since',
+  'Keep-Alive',
+  'Last-Modified',
+  'Link',
+  'Location',
+  'Max-Forwards',
+  'Origin',
+  'Permissions-Policy',
+  'Pragma',
+  'Proxy-Authenticate',
+  'Proxy-Authorization',
+  'RTT',
+  'Range',
+  'Referer',
+  'Referrer-Policy',
+  'Refresh',
+  'Retry-After',
+  'Sec-WebSocket-Accept',
+  'Sec-WebSocket-Extensions',
+  'Sec-WebSocket-Key',
+  'Sec-WebSocket-Protocol',
+  'Sec-WebSocket-Version',
+  'Server',
+  'Server-Timing',
+  'Service-Worker-Allowed',
+  'Service-Worker-Navigation-Preload',
+  'Set-Cookie',
+  'SourceMap',
+  'Strict-Transport-Security',
+  'Supports-Loading-Mode',
+  'TE',
+  'Timing-Allow-Origin',
+  'Trailer',
+  'Transfer-Encoding',
+  'Upgrade',
+  'Upgrade-Insecure-Requests',
+  'User-Agent',
+  'Vary',
+  'Via',
+  'WWW-Authenticate',
+  'X-Content-Type-Options',
+  'X-DNS-Prefetch-Control',
+  'X-Frame-Options',
+  'X-Permitted-Cross-Domain-Policies',
+  'X-Powered-By',
+  'X-Requested-With',
+  'X-XSS-Protection'
+]
+
+for (let i = 0; i < wellknownHeaderNames.length; ++i) {
+  const key = wellknownHeaderNames[i]
+  const lowerCasedKey = key.toLowerCase()
+  headerNameLowerCasedRecord[key] = headerNameLowerCasedRecord[lowerCasedKey] =
+    lowerCasedKey
+}
+
+// Note: object prototypes should not be able to be referenced. e.g. `Object#hasOwnProperty`.
+Object.setPrototypeOf(headerNameLowerCasedRecord, null)
+
+module.exports = {
+  wellknownHeaderNames,
+  headerNameLowerCasedRecord
+}
+
+
+/***/ }),
+
 /***/ 48045:
 /***/ ((module) => {
 
@@ -41494,6 +36440,19 @@ class ResponseExceededMaxSizeError extends UndiciError {
   }
 }
 
+class RequestRetryError extends UndiciError {
+  constructor (message, code, { headers, data }) {
+    super(message)
+    Error.captureStackTrace(this, RequestRetryError)
+    this.name = 'RequestRetryError'
+    this.message = message || 'Request retry error'
+    this.code = 'UND_ERR_REQ_RETRY'
+    this.statusCode = code
+    this.data = data
+    this.headers = headers
+  }
+}
+
 module.exports = {
   HTTPParserError,
   UndiciError,
@@ -41513,7 +36472,8 @@ module.exports = {
   NotSupportedError,
   ResponseContentLengthMismatchError,
   BalancedPoolMissingUpstreamError,
-  ResponseExceededMaxSizeError
+  ResponseExceededMaxSizeError,
+  RequestRetryError
 }
 
 
@@ -41637,10 +36597,29 @@ class Request {
 
     this.method = method
 
+    this.abort = null
+
     if (body == null) {
       this.body = null
     } else if (util.isStream(body)) {
       this.body = body
+
+      const rState = this.body._readableState
+      if (!rState || !rState.autoDestroy) {
+        this.endHandler = function autoDestroy () {
+          util.destroy(this)
+        }
+        this.body.on('end', this.endHandler)
+      }
+
+      this.errorHandler = err => {
+        if (this.abort) {
+          this.abort(err)
+        } else {
+          this.error = err
+        }
+      }
+      this.body.on('error', this.errorHandler)
     } else if (util.isBuffer(body)) {
       this.body = body.byteLength ? body : null
     } else if (ArrayBuffer.isView(body)) {
@@ -41736,9 +36715,9 @@ class Request {
   onBodySent (chunk) {
     if (this[kHandler].onBodySent) {
       try {
-        this[kHandler].onBodySent(chunk)
+        return this[kHandler].onBodySent(chunk)
       } catch (err) {
-        this.onError(err)
+        this.abort(err)
       }
     }
   }
@@ -41747,13 +36726,26 @@ class Request {
     if (channels.bodySent.hasSubscribers) {
       channels.bodySent.publish({ request: this })
     }
+
+    if (this[kHandler].onRequestSent) {
+      try {
+        return this[kHandler].onRequestSent()
+      } catch (err) {
+        this.abort(err)
+      }
+    }
   }
 
   onConnect (abort) {
     assert(!this.aborted)
     assert(!this.completed)
 
-    return this[kHandler].onConnect(abort)
+    if (this.error) {
+      abort(this.error)
+    } else {
+      this.abort = abort
+      return this[kHandler].onConnect(abort)
+    }
   }
 
   onHeaders (statusCode, headers, resume, statusText) {
@@ -41764,14 +36756,23 @@ class Request {
       channels.headers.publish({ request: this, response: { statusCode, headers, statusText } })
     }
 
-    return this[kHandler].onHeaders(statusCode, headers, resume, statusText)
+    try {
+      return this[kHandler].onHeaders(statusCode, headers, resume, statusText)
+    } catch (err) {
+      this.abort(err)
+    }
   }
 
   onData (chunk) {
     assert(!this.aborted)
     assert(!this.completed)
 
-    return this[kHandler].onData(chunk)
+    try {
+      return this[kHandler].onData(chunk)
+    } catch (err) {
+      this.abort(err)
+      return false
+    }
   }
 
   onUpgrade (statusCode, headers, socket) {
@@ -41782,16 +36783,26 @@ class Request {
   }
 
   onComplete (trailers) {
+    this.onFinally()
+
     assert(!this.aborted)
 
     this.completed = true
     if (channels.trailers.hasSubscribers) {
       channels.trailers.publish({ request: this, trailers })
     }
-    return this[kHandler].onComplete(trailers)
+
+    try {
+      return this[kHandler].onComplete(trailers)
+    } catch (err) {
+      // TODO (fix): This might be a bad idea?
+      this.onError(err)
+    }
   }
 
   onError (error) {
+    this.onFinally()
+
     if (channels.error.hasSubscribers) {
       channels.error.publish({ request: this, error })
     }
@@ -41800,7 +36811,20 @@ class Request {
       return
     }
     this.aborted = true
+
     return this[kHandler].onError(error)
+  }
+
+  onFinally () {
+    if (this.errorHandler) {
+      this.body.off('error', this.errorHandler)
+      this.errorHandler = null
+    }
+
+    if (this.endHandler) {
+      this.body.off('end', this.endHandler)
+      this.endHandler = null
+    }
   }
 
   // TODO: adjust to support H2
@@ -42024,7 +37048,9 @@ module.exports = {
   kHTTP2BuildRequest: Symbol('http2 build request'),
   kHTTP1BuildRequest: Symbol('http1 build request'),
   kHTTP2CopyHeaders: Symbol('http2 copy headers'),
-  kHTTPConnVersion: Symbol('http connection version')
+  kHTTPConnVersion: Symbol('http connection version'),
+  kRetryHandlerDefaultRetry: Symbol('retry agent default retry'),
+  kConstruct: Symbol('constructable')
 }
 
 
@@ -42045,6 +37071,7 @@ const { InvalidArgumentError } = __nccwpck_require__(48045)
 const { Blob } = __nccwpck_require__(14300)
 const nodeUtil = __nccwpck_require__(73837)
 const { stringify } = __nccwpck_require__(63477)
+const { headerNameLowerCasedRecord } = __nccwpck_require__(14462)
 
 const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(v => Number(v))
 
@@ -42161,13 +37188,13 @@ function getHostname (host) {
     const idx = host.indexOf(']')
 
     assert(idx !== -1)
-    return host.substr(1, idx - 1)
+    return host.substring(1, idx)
   }
 
   const idx = host.indexOf(':')
   if (idx === -1) return host
 
-  return host.substr(0, idx)
+  return host.substring(0, idx)
 }
 
 // IP addresses are not valid server names per RFC6066
@@ -42226,7 +37253,7 @@ function isReadableAborted (stream) {
 }
 
 function destroy (stream, err) {
-  if (!isStream(stream) || isDestroyed(stream)) {
+  if (stream == null || !isStream(stream) || isDestroyed(stream)) {
     return
   }
 
@@ -42254,6 +37281,15 @@ function parseKeepAliveTimeout (val) {
   return m ? parseInt(m[1], 10) * 1000 : null
 }
 
+/**
+ * Retrieves a header name and returns its lowercase value.
+ * @param {string | Buffer} value Header name
+ * @returns {string}
+ */
+function headerNameToString (value) {
+  return headerNameLowerCasedRecord[value] || value.toLowerCase()
+}
+
 function parseHeaders (headers, obj = {}) {
   // For H2 support
   if (!Array.isArray(headers)) return headers
@@ -42264,7 +37300,7 @@ function parseHeaders (headers, obj = {}) {
 
     if (!val) {
       if (Array.isArray(headers[i + 1])) {
-        obj[key] = headers[i + 1]
+        obj[key] = headers[i + 1].map(x => x.toString('utf8'))
       } else {
         obj[key] = headers[i + 1].toString('utf8')
       }
@@ -42467,16 +37503,7 @@ function throwIfAborted (signal) {
   }
 }
 
-let events
 function addAbortListener (signal, listener) {
-  if (typeof Symbol.dispose === 'symbol') {
-    if (!events) {
-      events = __nccwpck_require__(82361)
-    }
-    if (typeof events.addAbortListener === 'function' && 'aborted' in signal) {
-      return events.addAbortListener(signal, listener)
-    }
-  }
   if ('addEventListener' in signal) {
     signal.addEventListener('abort', listener, { once: true })
     return () => signal.removeEventListener('abort', listener)
@@ -42500,6 +37527,21 @@ function toUSVString (val) {
   return `${val}`
 }
 
+// Parsed accordingly to RFC 9110
+// https://www.rfc-editor.org/rfc/rfc9110#field.content-range
+function parseRangeHeader (range) {
+  if (range == null || range === '') return { start: 0, end: null, size: null }
+
+  const m = range ? range.match(/^bytes (\d+)-(\d+)\/(\d+)?$/) : null
+  return m
+    ? {
+        start: parseInt(m[1]),
+        end: m[2] ? parseInt(m[2]) : null,
+        size: m[3] ? parseInt(m[3]) : null
+      }
+    : null
+}
+
 const kEnumerableProperty = Object.create(null)
 kEnumerableProperty.enumerable = true
 
@@ -42519,6 +37561,7 @@ module.exports = {
   isIterable,
   isAsyncIterable,
   isDestroyed,
+  headerNameToString,
   parseRawHeaders,
   parseHeaders,
   parseKeepAliveTimeout,
@@ -42533,9 +37576,11 @@ module.exports = {
   buildURL,
   throwIfAborted,
   addAbortListener,
+  parseRangeHeader,
   nodeMajor,
   nodeMinor,
-  nodeHasAutoSelectFamily: nodeMajor > 18 || (nodeMajor === 18 && nodeMinor >= 13)
+  nodeHasAutoSelectFamily: nodeMajor > 18 || (nodeMajor === 18 && nodeMinor >= 13),
+  safeHTTPMethods: ['GET', 'HEAD', 'OPTIONS', 'TRACE']
 }
 
 
@@ -42774,7 +37819,7 @@ module.exports = Dispatcher
 "use strict";
 
 
-const Busboy = __nccwpck_require__(33438)
+const Busboy = __nccwpck_require__(50727)
 const util = __nccwpck_require__(83983)
 const {
   ReadableStreamFrom,
@@ -42800,6 +37845,8 @@ let ReadableStream = globalThis.ReadableStream
 
 /** @type {globalThis['File']} */
 const File = NativeFile ?? UndiciFile
+const textEncoder = new TextEncoder()
+const textDecoder = new TextDecoder()
 
 // https://fetch.spec.whatwg.org/#concept-bodyinit-extract
 function extractBody (object, keepalive = false) {
@@ -42823,7 +37870,7 @@ function extractBody (object, keepalive = false) {
     stream = new ReadableStream({
       async pull (controller) {
         controller.enqueue(
-          typeof source === 'string' ? new TextEncoder().encode(source) : source
+          typeof source === 'string' ? textEncoder.encode(source) : source
         )
         queueMicrotask(() => readableStreamClose(controller))
       },
@@ -42893,7 +37940,6 @@ function extractBody (object, keepalive = false) {
     // - That the content-length is calculated in advance.
     // - And that all parts are pre-encoded and ready to be sent.
 
-    const enc = new TextEncoder()
     const blobParts = []
     const rn = new Uint8Array([13, 10]) // '\r\n'
     length = 0
@@ -42901,13 +37947,13 @@ function extractBody (object, keepalive = false) {
 
     for (const [name, value] of object) {
       if (typeof value === 'string') {
-        const chunk = enc.encode(prefix +
+        const chunk = textEncoder.encode(prefix +
           `; name="${escape(normalizeLinefeeds(name))}"` +
           `\r\n\r\n${normalizeLinefeeds(value)}\r\n`)
         blobParts.push(chunk)
         length += chunk.byteLength
       } else {
-        const chunk = enc.encode(`${prefix}; name="${escape(normalizeLinefeeds(name))}"` +
+        const chunk = textEncoder.encode(`${prefix}; name="${escape(normalizeLinefeeds(name))}"` +
           (value.name ? `; filename="${escape(value.name)}"` : '') + '\r\n' +
           `Content-Type: ${
             value.type || 'application/octet-stream'
@@ -42921,7 +37967,7 @@ function extractBody (object, keepalive = false) {
       }
     }
 
-    const chunk = enc.encode(`--${boundary}--`)
+    const chunk = textEncoder.encode(`--${boundary}--`)
     blobParts.push(chunk)
     length += chunk.byteLength
     if (hasUnknownSizeValue) {
@@ -43217,14 +38263,16 @@ function bodyMixinMethods (instance) {
           let text = ''
           // application/x-www-form-urlencoded parser will keep the BOM.
           // https://url.spec.whatwg.org/#concept-urlencoded-parser
-          const textDecoder = new TextDecoder('utf-8', { ignoreBOM: true })
+          // Note that streaming decoder is stateful and cannot be reused
+          const streamingDecoder = new TextDecoder('utf-8', { ignoreBOM: true })
+
           for await (const chunk of consumeBody(this[kState].body)) {
             if (!isUint8Array(chunk)) {
               throw new TypeError('Expected Uint8Array chunk')
             }
-            text += textDecoder.decode(chunk, { stream: true })
+            text += streamingDecoder.decode(chunk, { stream: true })
           }
-          text += textDecoder.decode()
+          text += streamingDecoder.decode()
           entries = new URLSearchParams(text)
         } catch (err) {
           // istanbul ignore next: Unclear when new URLSearchParams can fail on a string.
@@ -43339,7 +38387,7 @@ function utf8DecodeBytes (buffer) {
 
   // 3. Process a queue with an instance of UTF-8’s
   //    decoder, ioQueue, output, and "replacement".
-  const output = new TextDecoder().decode(buffer)
+  const output = textDecoder.decode(buffer)
 
   // 4. Return output.
   return output
@@ -43387,10 +38435,12 @@ module.exports = {
 const { MessageChannel, receiveMessageOnPort } = __nccwpck_require__(71267)
 
 const corsSafeListedMethods = ['GET', 'HEAD', 'POST']
+const corsSafeListedMethodsSet = new Set(corsSafeListedMethods)
 
 const nullBodyStatus = [101, 204, 205, 304]
 
 const redirectStatus = [301, 302, 303, 307, 308]
+const redirectStatusSet = new Set(redirectStatus)
 
 // https://fetch.spec.whatwg.org/#block-bad-port
 const badPorts = [
@@ -43401,6 +38451,8 @@ const badPorts = [
   '2049', '3659', '4045', '5060', '5061', '6000', '6566', '6665', '6666', '6667', '6668', '6669', '6697',
   '10080'
 ]
+
+const badPortsSet = new Set(badPorts)
 
 // https://w3c.github.io/webappsec-referrer-policy/#referrer-policies
 const referrerPolicy = [
@@ -43414,10 +38466,12 @@ const referrerPolicy = [
   'strict-origin-when-cross-origin',
   'unsafe-url'
 ]
+const referrerPolicySet = new Set(referrerPolicy)
 
 const requestRedirect = ['follow', 'manual', 'error']
 
 const safeMethods = ['GET', 'HEAD', 'OPTIONS', 'TRACE']
+const safeMethodsSet = new Set(safeMethods)
 
 const requestMode = ['navigate', 'same-origin', 'no-cors', 'cors']
 
@@ -43452,6 +38506,7 @@ const requestDuplex = [
 
 // http://fetch.spec.whatwg.org/#forbidden-method
 const forbiddenMethods = ['CONNECT', 'TRACE', 'TRACK']
+const forbiddenMethodsSet = new Set(forbiddenMethods)
 
 const subresource = [
   'audio',
@@ -43467,6 +38522,7 @@ const subresource = [
   'xslt',
   ''
 ]
+const subresourceSet = new Set(subresource)
 
 /** @type {globalThis['DOMException']} */
 const DOMException = globalThis.DOMException ?? (() => {
@@ -43516,7 +38572,14 @@ module.exports = {
   nullBodyStatus,
   safeMethods,
   badPorts,
-  requestDuplex
+  requestDuplex,
+  subresourceSet,
+  badPortsSet,
+  redirectStatusSet,
+  corsSafeListedMethodsSet,
+  safeMethodsSet,
+  forbiddenMethodsSet,
+  referrerPolicySet
 }
 
 
@@ -43646,17 +38709,14 @@ function dataURLProcessor (dataURL) {
  * @param {boolean} excludeFragment
  */
 function URLSerializer (url, excludeFragment = false) {
-  const href = url.href
-
   if (!excludeFragment) {
-    return href
+    return url.href
   }
 
-  const hash = href.lastIndexOf('#')
-  if (hash === -1) {
-    return href
-  }
-  return href.slice(0, hash)
+  const href = url.href
+  const hashLength = url.hash.length
+
+  return hashLength === 0 ? href : href.substring(0, href.length - hashLength)
 }
 
 // https://infra.spec.whatwg.org/#collect-a-sequence-of-code-points
@@ -44172,6 +39232,7 @@ const { isBlobLike } = __nccwpck_require__(52538)
 const { webidl } = __nccwpck_require__(21744)
 const { parseMIMEType, serializeAMimeType } = __nccwpck_require__(685)
 const { kEnumerableProperty } = __nccwpck_require__(83983)
+const encoder = new TextEncoder()
 
 class File extends Blob {
   constructor (fileBits, fileName, options = {}) {
@@ -44445,7 +39506,7 @@ function processBlobParts (parts, options) {
       }
 
       // 3. Append the result of UTF-8 encoding s to bytes.
-      bytes.push(new TextEncoder().encode(s))
+      bytes.push(encoder.encode(s))
     } else if (
       types.isAnyArrayBuffer(element) ||
       types.isTypedArray(element)
@@ -44839,7 +39900,7 @@ module.exports = {
 
 
 
-const { kHeadersList } = __nccwpck_require__(72785)
+const { kHeadersList, kConstruct } = __nccwpck_require__(72785)
 const { kGuard } = __nccwpck_require__(15861)
 const { kEnumerableProperty } = __nccwpck_require__(83983)
 const {
@@ -44854,6 +39915,13 @@ const kHeadersMap = Symbol('headers map')
 const kHeadersSortedMap = Symbol('headers map sorted')
 
 /**
+ * @param {number} code
+ */
+function isHTTPWhiteSpaceCharCode (code) {
+  return code === 0x00a || code === 0x00d || code === 0x009 || code === 0x020
+}
+
+/**
  * @see https://fetch.spec.whatwg.org/#concept-header-value-normalize
  * @param {string} potentialValue
  */
@@ -44861,12 +39929,12 @@ function headerValueNormalize (potentialValue) {
   //  To normalize a byte sequence potentialValue, remove
   //  any leading and trailing HTTP whitespace bytes from
   //  potentialValue.
+  let i = 0; let j = potentialValue.length
 
-  // Trimming the end with `.replace()` and a RegExp is typically subject to
-  // ReDoS. This is safer and faster.
-  let i = potentialValue.length
-  while (/[\r\n\t ]/.test(potentialValue.charAt(--i)));
-  return potentialValue.slice(0, i + 1).replace(/^[\r\n\t ]+/, '')
+  while (j > i && isHTTPWhiteSpaceCharCode(potentialValue.charCodeAt(j - 1))) --j
+  while (j > i && isHTTPWhiteSpaceCharCode(potentialValue.charCodeAt(i))) ++i
+
+  return i === 0 && j === potentialValue.length ? potentialValue : potentialValue.substring(i, j)
 }
 
 function fill (headers, object) {
@@ -44875,7 +39943,8 @@ function fill (headers, object) {
   // 1. If object is a sequence, then for each header in object:
   // Note: webidl conversion to array has already been done.
   if (Array.isArray(object)) {
-    for (const header of object) {
+    for (let i = 0; i < object.length; ++i) {
+      const header = object[i]
       // 1. If header does not contain exactly two items, then throw a TypeError.
       if (header.length !== 2) {
         throw webidl.errors.exception({
@@ -44885,15 +39954,16 @@ function fill (headers, object) {
       }
 
       // 2. Append (header’s first item, header’s second item) to headers.
-      headers.append(header[0], header[1])
+      appendHeader(headers, header[0], header[1])
     }
   } else if (typeof object === 'object' && object !== null) {
     // Note: null should throw
 
     // 2. Otherwise, object is a record, then for each key → value in object,
     //    append (key, value) to headers
-    for (const [key, value] of Object.entries(object)) {
-      headers.append(key, value)
+    const keys = Object.keys(object)
+    for (let i = 0; i < keys.length; ++i) {
+      appendHeader(headers, keys[i], object[keys[i]])
     }
   } else {
     throw webidl.errors.conversionFailed({
@@ -44904,6 +39974,50 @@ function fill (headers, object) {
   }
 }
 
+/**
+ * @see https://fetch.spec.whatwg.org/#concept-headers-append
+ */
+function appendHeader (headers, name, value) {
+  // 1. Normalize value.
+  value = headerValueNormalize(value)
+
+  // 2. If name is not a header name or value is not a
+  //    header value, then throw a TypeError.
+  if (!isValidHeaderName(name)) {
+    throw webidl.errors.invalidArgument({
+      prefix: 'Headers.append',
+      value: name,
+      type: 'header name'
+    })
+  } else if (!isValidHeaderValue(value)) {
+    throw webidl.errors.invalidArgument({
+      prefix: 'Headers.append',
+      value,
+      type: 'header value'
+    })
+  }
+
+  // 3. If headers’s guard is "immutable", then throw a TypeError.
+  // 4. Otherwise, if headers’s guard is "request" and name is a
+  //    forbidden header name, return.
+  // Note: undici does not implement forbidden header names
+  if (headers[kGuard] === 'immutable') {
+    throw new TypeError('immutable')
+  } else if (headers[kGuard] === 'request-no-cors') {
+    // 5. Otherwise, if headers’s guard is "request-no-cors":
+    // TODO
+  }
+
+  // 6. Otherwise, if headers’s guard is "response" and name is a
+  //    forbidden response-header name, return.
+
+  // 7. Append (name, value) to headers’s header list.
+  return headers[kHeadersList].append(name, value)
+
+  // 8. If headers’s guard is "request-no-cors", then remove
+  //    privileged no-CORS request headers from headers
+}
+
 class HeadersList {
   /** @type {[string, string][]|null} */
   cookies = null
@@ -44912,7 +40026,7 @@ class HeadersList {
     if (init instanceof HeadersList) {
       this[kHeadersMap] = new Map(init[kHeadersMap])
       this[kHeadersSortedMap] = init[kHeadersSortedMap]
-      this.cookies = init.cookies
+      this.cookies = init.cookies === null ? null : [...init.cookies]
     } else {
       this[kHeadersMap] = new Map(init)
       this[kHeadersSortedMap] = null
@@ -44974,7 +40088,7 @@ class HeadersList {
     //    the first such header to value and remove the
     //    others.
     // 2. Otherwise, append header (name, value) to list.
-    return this[kHeadersMap].set(lowercaseName, { name, value })
+    this[kHeadersMap].set(lowercaseName, { name, value })
   }
 
   // https://fetch.spec.whatwg.org/#concept-header-list-delete
@@ -44987,20 +40101,18 @@ class HeadersList {
       this.cookies = null
     }
 
-    return this[kHeadersMap].delete(name)
+    this[kHeadersMap].delete(name)
   }
 
   // https://fetch.spec.whatwg.org/#concept-header-list-get
   get (name) {
-    // 1. If list does not contain name, then return null.
-    if (!this.contains(name)) {
-      return null
-    }
+    const value = this[kHeadersMap].get(name.toLowerCase())
 
+    // 1. If list does not contain name, then return null.
     // 2. Return the values of all headers in list whose name
     //    is a byte-case-insensitive match for name,
     //    separated from each other by 0x2C 0x20, in order.
-    return this[kHeadersMap].get(name.toLowerCase())?.value ?? null
+    return value === undefined ? null : value.value
   }
 
   * [Symbol.iterator] () {
@@ -45026,6 +40138,9 @@ class HeadersList {
 // https://fetch.spec.whatwg.org/#headers-class
 class Headers {
   constructor (init = undefined) {
+    if (init === kConstruct) {
+      return
+    }
     this[kHeadersList] = new HeadersList()
 
     // The new Headers(init) constructor steps are:
@@ -45049,43 +40164,7 @@ class Headers {
     name = webidl.converters.ByteString(name)
     value = webidl.converters.ByteString(value)
 
-    // 1. Normalize value.
-    value = headerValueNormalize(value)
-
-    // 2. If name is not a header name or value is not a
-    //    header value, then throw a TypeError.
-    if (!isValidHeaderName(name)) {
-      throw webidl.errors.invalidArgument({
-        prefix: 'Headers.append',
-        value: name,
-        type: 'header name'
-      })
-    } else if (!isValidHeaderValue(value)) {
-      throw webidl.errors.invalidArgument({
-        prefix: 'Headers.append',
-        value,
-        type: 'header value'
-      })
-    }
-
-    // 3. If headers’s guard is "immutable", then throw a TypeError.
-    // 4. Otherwise, if headers’s guard is "request" and name is a
-    //    forbidden header name, return.
-    // Note: undici does not implement forbidden header names
-    if (this[kGuard] === 'immutable') {
-      throw new TypeError('immutable')
-    } else if (this[kGuard] === 'request-no-cors') {
-      // 5. Otherwise, if headers’s guard is "request-no-cors":
-      // TODO
-    }
-
-    // 6. Otherwise, if headers’s guard is "response" and name is a
-    //    forbidden response-header name, return.
-
-    // 7. Append (name, value) to headers’s header list.
-    // 8. If headers’s guard is "request-no-cors", then remove
-    //    privileged no-CORS request headers from headers
-    return this[kHeadersList].append(name, value)
+    return appendHeader(this, name, value)
   }
 
   // https://fetch.spec.whatwg.org/#dom-headers-delete
@@ -45130,7 +40209,7 @@ class Headers {
     // 7. Delete name from this’s header list.
     // 8. If this’s guard is "request-no-cors", then remove
     //    privileged no-CORS request headers from this.
-    return this[kHeadersList].delete(name)
+    this[kHeadersList].delete(name)
   }
 
   // https://fetch.spec.whatwg.org/#dom-headers-get
@@ -45223,7 +40302,7 @@ class Headers {
     // 7. Set (name, value) in this’s header list.
     // 8. If this’s guard is "request-no-cors", then remove
     //    privileged no-CORS request headers from this
-    return this[kHeadersList].set(name, value)
+    this[kHeadersList].set(name, value)
   }
 
   // https://fetch.spec.whatwg.org/#dom-headers-getsetcookie
@@ -45259,7 +40338,8 @@ class Headers {
     const cookies = this[kHeadersList].cookies
 
     // 3. For each name of names:
-    for (const [name, value] of names) {
+    for (let i = 0; i < names.length; ++i) {
+      const [name, value] = names[i]
       // 1. If name is `set-cookie`, then:
       if (name === 'set-cookie') {
         // 1. Let values be a list of all values of headers in list whose name
@@ -45267,8 +40347,8 @@ class Headers {
 
         // 2. For each value of values:
         // 1. Append (name, value) to headers.
-        for (const value of cookies) {
-          headers.push([name, value])
+        for (let j = 0; j < cookies.length; ++j) {
+          headers.push([name, cookies[j]])
         }
       } else {
         // 2. Otherwise:
@@ -45292,6 +40372,12 @@ class Headers {
   keys () {
     webidl.brandCheck(this, Headers)
 
+    if (this[kGuard] === 'immutable') {
+      const value = this[kHeadersSortedMap]
+      return makeIterator(() => value, 'Headers',
+        'key')
+    }
+
     return makeIterator(
       () => [...this[kHeadersSortedMap].values()],
       'Headers',
@@ -45302,6 +40388,12 @@ class Headers {
   values () {
     webidl.brandCheck(this, Headers)
 
+    if (this[kGuard] === 'immutable') {
+      const value = this[kHeadersSortedMap]
+      return makeIterator(() => value, 'Headers',
+        'value')
+    }
+
     return makeIterator(
       () => [...this[kHeadersSortedMap].values()],
       'Headers',
@@ -45311,6 +40403,12 @@ class Headers {
 
   entries () {
     webidl.brandCheck(this, Headers)
+
+    if (this[kGuard] === 'immutable') {
+      const value = this[kHeadersSortedMap]
+      return makeIterator(() => value, 'Headers',
+        'key+value')
+    }
 
     return makeIterator(
       () => [...this[kHeadersSortedMap].values()],
@@ -45443,11 +40541,11 @@ const { kState, kHeaders, kGuard, kRealm } = __nccwpck_require__(15861)
 const assert = __nccwpck_require__(39491)
 const { safelyExtractBody } = __nccwpck_require__(41472)
 const {
-  redirectStatus,
+  redirectStatusSet,
   nullBodyStatus,
-  safeMethods,
+  safeMethodsSet,
   requestBodyHeader,
-  subresource,
+  subresourceSet,
   DOMException
 } = __nccwpck_require__(41037)
 const { kHeadersList } = __nccwpck_require__(72785)
@@ -45459,6 +40557,7 @@ const { TransformStream } = __nccwpck_require__(35356)
 const { getGlobalDispatcher } = __nccwpck_require__(21892)
 const { webidl } = __nccwpck_require__(21744)
 const { STATUS_CODES } = __nccwpck_require__(13685)
+const GET_OR_HEAD = ['GET', 'HEAD']
 
 /** @type {import('buffer').resolveObjectURL} */
 let resolveObjectURL
@@ -45518,7 +40617,7 @@ class Fetch extends EE {
 }
 
 // https://fetch.spec.whatwg.org/#fetch-method
-async function fetch (input, init = {}) {
+function fetch (input, init = {}) {
   webidl.argumentLengthCheck(arguments, 1, { header: 'globalThis.fetch' })
 
   // 1. Let p be a new promise.
@@ -45601,7 +40700,7 @@ async function fetch (input, init = {}) {
   const processResponse = (response) => {
     // 1. If locallyAborted is true, terminate these substeps.
     if (locallyAborted) {
-      return
+      return Promise.resolve()
     }
 
     // 2. If response’s aborted flag is set, then:
@@ -45614,7 +40713,7 @@ async function fetch (input, init = {}) {
       //    deserializedError.
 
       abortFetch(p, request, responseObject, controller.serializedAbortReason)
-      return
+      return Promise.resolve()
     }
 
     // 3. If response is a network error, then reject p with a TypeError
@@ -45623,7 +40722,7 @@ async function fetch (input, init = {}) {
       p.reject(
         Object.assign(new TypeError('fetch failed'), { cause: response.error })
       )
-      return
+      return Promise.resolve()
     }
 
     // 4. Set responseObject to the result of creating a Response object,
@@ -45682,7 +40781,7 @@ function finalizeAndReportTiming (response, initiatorType = 'other') {
   }
 
   // 8. If response’s timing allow passed flag is not set, then:
-  if (!timingInfo.timingAllowPassed) {
+  if (!response.timingAllowPassed) {
     //  1. Set timingInfo to a the result of creating an opaque timing info for timingInfo.
     timingInfo = createOpaqueTimingInfo({
       startTime: timingInfo.startTime
@@ -45906,7 +41005,7 @@ function fetching ({
   }
 
   // 15. If request is a subresource request, then:
-  if (subresource.includes(request.destination)) {
+  if (subresourceSet.has(request.destination)) {
     // TODO
   }
 
@@ -46173,13 +41272,13 @@ async function mainFetch (fetchParams, recursive = false) {
 
 // https://fetch.spec.whatwg.org/#concept-scheme-fetch
 // given a fetch params fetchParams
-async function schemeFetch (fetchParams) {
+function schemeFetch (fetchParams) {
   // Note: since the connection is destroyed on redirect, which sets fetchParams to a
   // cancelled state, we do not want this condition to trigger *unless* there have been
   // no redirects. See https://github.com/nodejs/undici/issues/1776
   // 1. If fetchParams is canceled, then return the appropriate network error for fetchParams.
   if (isCancelled(fetchParams) && fetchParams.request.redirectCount === 0) {
-    return makeAppropriateNetworkError(fetchParams)
+    return Promise.resolve(makeAppropriateNetworkError(fetchParams))
   }
 
   // 2. Let request be fetchParams’s request.
@@ -46195,7 +41294,7 @@ async function schemeFetch (fetchParams) {
       // and body is the empty byte sequence as a body.
 
       // Otherwise, return a network error.
-      return makeNetworkError('about scheme is not supported')
+      return Promise.resolve(makeNetworkError('about scheme is not supported'))
     }
     case 'blob:': {
       if (!resolveObjectURL) {
@@ -46208,7 +41307,7 @@ async function schemeFetch (fetchParams) {
       // https://github.com/web-platform-tests/wpt/blob/7b0ebaccc62b566a1965396e5be7bb2bc06f841f/FileAPI/url/resources/fetch-tests.js#L52-L56
       // Buffer.resolveObjectURL does not ignore URL queries.
       if (blobURLEntry.search.length !== 0) {
-        return makeNetworkError('NetworkError when attempting to fetch resource.')
+        return Promise.resolve(makeNetworkError('NetworkError when attempting to fetch resource.'))
       }
 
       const blobURLEntryObject = resolveObjectURL(blobURLEntry.toString())
@@ -46216,7 +41315,7 @@ async function schemeFetch (fetchParams) {
       // 2. If request’s method is not `GET`, blobURLEntry is null, or blobURLEntry’s
       //    object is not a Blob object, then return a network error.
       if (request.method !== 'GET' || !isBlobLike(blobURLEntryObject)) {
-        return makeNetworkError('invalid method')
+        return Promise.resolve(makeNetworkError('invalid method'))
       }
 
       // 3. Let bodyWithType be the result of safely extracting blobURLEntry’s object.
@@ -46243,7 +41342,7 @@ async function schemeFetch (fetchParams) {
 
       response.body = body
 
-      return response
+      return Promise.resolve(response)
     }
     case 'data:': {
       // 1. Let dataURLStruct be the result of running the
@@ -46254,7 +41353,7 @@ async function schemeFetch (fetchParams) {
       // 2. If dataURLStruct is failure, then return a
       //    network error.
       if (dataURLStruct === 'failure') {
-        return makeNetworkError('failed to fetch the data URL')
+        return Promise.resolve(makeNetworkError('failed to fetch the data URL'))
       }
 
       // 3. Let mimeType be dataURLStruct’s MIME type, serialized.
@@ -46263,28 +41362,28 @@ async function schemeFetch (fetchParams) {
       // 4. Return a response whose status message is `OK`,
       //    header list is « (`Content-Type`, mimeType) »,
       //    and body is dataURLStruct’s body as a body.
-      return makeResponse({
+      return Promise.resolve(makeResponse({
         statusText: 'OK',
         headersList: [
           ['content-type', { name: 'Content-Type', value: mimeType }]
         ],
         body: safelyExtractBody(dataURLStruct.body)[0]
-      })
+      }))
     }
     case 'file:': {
       // For now, unfortunate as it is, file URLs are left as an exercise for the reader.
       // When in doubt, return a network error.
-      return makeNetworkError('not implemented... yet...')
+      return Promise.resolve(makeNetworkError('not implemented... yet...'))
     }
     case 'http:':
     case 'https:': {
       // Return the result of running HTTP fetch given fetchParams.
 
-      return await httpFetch(fetchParams)
+      return httpFetch(fetchParams)
         .catch((err) => makeNetworkError(err))
     }
     default: {
-      return makeNetworkError('unknown scheme')
+      return Promise.resolve(makeNetworkError('unknown scheme'))
     }
   }
 }
@@ -46303,7 +41402,7 @@ function finalizeResponse (fetchParams, response) {
 }
 
 // https://fetch.spec.whatwg.org/#fetch-finale
-async function fetchFinale (fetchParams, response) {
+function fetchFinale (fetchParams, response) {
   // 1. If response is a network error, then:
   if (response.type === 'error') {
     // 1. Set response’s URL list to « fetchParams’s request’s URL list[0] ».
@@ -46387,8 +41486,9 @@ async function fetchFinale (fetchParams, response) {
     } else {
       // 4. Otherwise, fully read response’s body given processBody, processBodyError,
       // and fetchParams’s task destination.
-      await fullyReadBody(response.body, processBody, processBodyError)
+      return fullyReadBody(response.body, processBody, processBodyError)
     }
+    return Promise.resolve()
   }
 }
 
@@ -46459,7 +41559,7 @@ async function httpFetch (fetchParams) {
   }
 
   // 8. If actualResponse’s status is a redirect status, then:
-  if (redirectStatus.includes(actualResponse.status)) {
+  if (redirectStatusSet.has(actualResponse.status)) {
     // 1. If actualResponse’s status is not 303, request’s body is not null,
     // and the connection uses HTTP/2, then user agents may, and are even
     // encouraged to, transmit an RST_STREAM frame.
@@ -46496,7 +41596,7 @@ async function httpFetch (fetchParams) {
 }
 
 // https://fetch.spec.whatwg.org/#http-redirect-fetch
-async function httpRedirectFetch (fetchParams, response) {
+function httpRedirectFetch (fetchParams, response) {
   // 1. Let request be fetchParams’s request.
   const request = fetchParams.request
 
@@ -46522,18 +41622,18 @@ async function httpRedirectFetch (fetchParams, response) {
     }
   } catch (err) {
     // 5. If locationURL is failure, then return a network error.
-    return makeNetworkError(err)
+    return Promise.resolve(makeNetworkError(err))
   }
 
   // 6. If locationURL’s scheme is not an HTTP(S) scheme, then return a network
   // error.
   if (!urlIsHttpHttpsScheme(locationURL)) {
-    return makeNetworkError('URL scheme must be a HTTP(S) scheme')
+    return Promise.resolve(makeNetworkError('URL scheme must be a HTTP(S) scheme'))
   }
 
   // 7. If request’s redirect count is 20, then return a network error.
   if (request.redirectCount === 20) {
-    return makeNetworkError('redirect count exceeded')
+    return Promise.resolve(makeNetworkError('redirect count exceeded'))
   }
 
   // 8. Increase request’s redirect count by 1.
@@ -46547,7 +41647,7 @@ async function httpRedirectFetch (fetchParams, response) {
     (locationURL.username || locationURL.password) &&
     !sameOrigin(request, locationURL)
   ) {
-    return makeNetworkError('cross origin not allowed for request mode "cors"')
+    return Promise.resolve(makeNetworkError('cross origin not allowed for request mode "cors"'))
   }
 
   // 10. If request’s response tainting is "cors" and locationURL includes
@@ -46556,9 +41656,9 @@ async function httpRedirectFetch (fetchParams, response) {
     request.responseTainting === 'cors' &&
     (locationURL.username || locationURL.password)
   ) {
-    return makeNetworkError(
+    return Promise.resolve(makeNetworkError(
       'URL cannot contain credentials for request mode "cors"'
-    )
+    ))
   }
 
   // 11. If actualResponse’s status is not 303, request’s body is non-null,
@@ -46568,7 +41668,7 @@ async function httpRedirectFetch (fetchParams, response) {
     request.body != null &&
     request.body.source == null
   ) {
-    return makeNetworkError()
+    return Promise.resolve(makeNetworkError())
   }
 
   // 12. If one of the following is true
@@ -46577,7 +41677,7 @@ async function httpRedirectFetch (fetchParams, response) {
   if (
     ([301, 302].includes(actualResponse.status) && request.method === 'POST') ||
     (actualResponse.status === 303 &&
-      !['GET', 'HEAD'].includes(request.method))
+      !GET_OR_HEAD.includes(request.method))
   ) {
     // then:
     // 1. Set request’s method to `GET` and request’s body to null.
@@ -46597,6 +41697,9 @@ async function httpRedirectFetch (fetchParams, response) {
   if (!sameOrigin(requestCurrentURL(request), locationURL)) {
     // https://fetch.spec.whatwg.org/#cors-non-wildcard-request-header-name
     request.headersList.delete('authorization')
+
+    // https://fetch.spec.whatwg.org/#authentication-entries
+    request.headersList.delete('proxy-authorization', true)
 
     // "Cookie" and "Host" are forbidden request-headers, which undici doesn't implement.
     request.headersList.delete('cookie')
@@ -46861,7 +41964,7 @@ async function httpNetworkOrCacheFetch (
     // responses in httpCache, as per the "Invalidation" chapter of HTTP
     // Caching, and set storedResponse to null. [HTTP-CACHING]
     if (
-      !safeMethods.includes(httpRequest.method) &&
+      !safeMethodsSet.has(httpRequest.method) &&
       forwardResponse.status >= 200 &&
       forwardResponse.status <= 399
     ) {
@@ -47352,7 +42455,7 @@ async function httpNetworkFetch (
         path: url.pathname + url.search,
         origin: url.origin,
         method: request.method,
-        body: fetchParams.controller.dispatcher.isMockActive ? request.body && request.body.source : body,
+        body: fetchParams.controller.dispatcher.isMockActive ? request.body && (request.body.source || request.body.stream) : body,
         headers: request.headersList.entries,
         maxRedirections: 0,
         upgrade: request.mode === 'websocket' ? 'websocket' : undefined
@@ -47397,7 +42500,7 @@ async function httpNetworkFetch (
                 location = val
               }
 
-              headers.append(key, val)
+              headers[kHeadersList].append(key, val)
             }
           } else {
             const keys = Object.keys(headersList)
@@ -47411,7 +42514,7 @@ async function httpNetworkFetch (
                 location = val
               }
 
-              headers.append(key, val)
+              headers[kHeadersList].append(key, val)
             }
           }
 
@@ -47421,7 +42524,7 @@ async function httpNetworkFetch (
 
           const willFollow = request.redirect === 'follow' &&
             location &&
-            redirectStatus.includes(status)
+            redirectStatusSet.has(status)
 
           // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Encoding
           if (request.method !== 'HEAD' && request.method !== 'CONNECT' && !nullBodyStatus.includes(status) && !willFollow) {
@@ -47515,7 +42618,7 @@ async function httpNetworkFetch (
             const key = headersList[n + 0].toString('latin1')
             const val = headersList[n + 1].toString('latin1')
 
-            headers.append(key, val)
+            headers[kHeadersList].append(key, val)
           }
 
           resolve({
@@ -47558,11 +42661,12 @@ const {
   isValidHTTPToken,
   sameOrigin,
   normalizeMethod,
-  makePolicyContainer
+  makePolicyContainer,
+  normalizeMethodRecord
 } = __nccwpck_require__(52538)
 const {
-  forbiddenMethods,
-  corsSafeListedMethods,
+  forbiddenMethodsSet,
+  corsSafeListedMethodsSet,
   referrerPolicy,
   requestRedirect,
   requestMode,
@@ -47575,13 +42679,12 @@ const { kHeaders, kSignal, kState, kGuard, kRealm } = __nccwpck_require__(15861)
 const { webidl } = __nccwpck_require__(21744)
 const { getGlobalOrigin } = __nccwpck_require__(71246)
 const { URLSerializer } = __nccwpck_require__(685)
-const { kHeadersList } = __nccwpck_require__(72785)
+const { kHeadersList, kConstruct } = __nccwpck_require__(72785)
 const assert = __nccwpck_require__(39491)
 const { getMaxListeners, setMaxListeners, getEventListeners, defaultMaxListeners } = __nccwpck_require__(82361)
 
 let TransformStream = globalThis.TransformStream
 
-const kInit = Symbol('init')
 const kAbortController = Symbol('abortController')
 
 const requestFinalizer = new FinalizationRegistry(({ signal, abort }) => {
@@ -47592,7 +42695,7 @@ const requestFinalizer = new FinalizationRegistry(({ signal, abort }) => {
 class Request {
   // https://fetch.spec.whatwg.org/#dom-request
   constructor (input, init = {}) {
-    if (input === kInit) {
+    if (input === kConstruct) {
       return
     }
 
@@ -47731,8 +42834,10 @@ class Request {
       urlList: [...request.urlList]
     })
 
+    const initHasKey = Object.keys(init).length !== 0
+
     // 13. If init is not empty, then:
-    if (Object.keys(init).length > 0) {
+    if (initHasKey) {
       // 1. If request’s mode is "navigate", then set it to "same-origin".
       if (request.mode === 'navigate') {
         request.mode = 'same-origin'
@@ -47847,7 +42952,7 @@ class Request {
     }
 
     // 23. If init["integrity"] exists, then set request’s integrity metadata to it.
-    if (init.integrity !== undefined && init.integrity != null) {
+    if (init.integrity != null) {
       request.integrity = String(init.integrity)
     }
 
@@ -47863,16 +42968,16 @@ class Request {
 
       // 2. If method is not a method or method is a forbidden method, then
       // throw a TypeError.
-      if (!isValidHTTPToken(init.method)) {
-        throw TypeError(`'${init.method}' is not a valid HTTP method.`)
+      if (!isValidHTTPToken(method)) {
+        throw new TypeError(`'${method}' is not a valid HTTP method.`)
       }
 
-      if (forbiddenMethods.indexOf(method.toUpperCase()) !== -1) {
-        throw TypeError(`'${init.method}' HTTP method is unsupported.`)
+      if (forbiddenMethodsSet.has(method.toUpperCase())) {
+        throw new TypeError(`'${method}' HTTP method is unsupported.`)
       }
 
       // 3. Normalize method.
-      method = normalizeMethod(init.method)
+      method = normalizeMethodRecord[method] ?? normalizeMethod(method)
 
       // 4. Set request’s method to method.
       request.method = method
@@ -47943,7 +43048,7 @@ class Request {
     // 30. Set this’s headers to a new Headers object with this’s relevant
     // Realm, whose header list is request’s header list and guard is
     // "request".
-    this[kHeaders] = new Headers()
+    this[kHeaders] = new Headers(kConstruct)
     this[kHeaders][kHeadersList] = request.headersList
     this[kHeaders][kGuard] = 'request'
     this[kHeaders][kRealm] = this[kRealm]
@@ -47952,7 +43057,7 @@ class Request {
     if (mode === 'no-cors') {
       // 1. If this’s request’s method is not a CORS-safelisted method,
       // then throw a TypeError.
-      if (!corsSafeListedMethods.includes(request.method)) {
+      if (!corsSafeListedMethodsSet.has(request.method)) {
         throw new TypeError(
           `'${request.method} is unsupported in no-cors mode.`
         )
@@ -47963,25 +43068,25 @@ class Request {
     }
 
     // 32. If init is not empty, then:
-    if (Object.keys(init).length !== 0) {
+    if (initHasKey) {
+      /** @type {HeadersList} */
+      const headersList = this[kHeaders][kHeadersList]
       // 1. Let headers be a copy of this’s headers and its associated header
       // list.
-      let headers = new Headers(this[kHeaders])
-
       // 2. If init["headers"] exists, then set headers to init["headers"].
-      if (init.headers !== undefined) {
-        headers = init.headers
-      }
+      const headers = init.headers !== undefined ? init.headers : new HeadersList(headersList)
 
       // 3. Empty this’s headers’s header list.
-      this[kHeaders][kHeadersList].clear()
+      headersList.clear()
 
       // 4. If headers is a Headers object, then for each header in its header
       // list, append header’s name/header’s value to this’s headers.
-      if (headers.constructor.name === 'Headers') {
+      if (headers instanceof HeadersList) {
         for (const [key, val] of headers) {
-          this[kHeaders].append(key, val)
+          headersList.append(key, val)
         }
+        // Note: Copy the `set-cookie` meta-data.
+        headersList.cookies = headers.cookies
       } else {
         // 5. Otherwise, fill this’s headers with headers.
         fillHeaders(this[kHeaders], headers)
@@ -48270,10 +43375,10 @@ class Request {
 
     // 3. Let clonedRequestObject be the result of creating a Request object,
     // given clonedRequest, this’s headers’s guard, and this’s relevant Realm.
-    const clonedRequestObject = new Request(kInit)
+    const clonedRequestObject = new Request(kConstruct)
     clonedRequestObject[kState] = clonedRequest
     clonedRequestObject[kRealm] = this[kRealm]
-    clonedRequestObject[kHeaders] = new Headers()
+    clonedRequestObject[kHeaders] = new Headers(kConstruct)
     clonedRequestObject[kHeaders][kHeadersList] = clonedRequest.headersList
     clonedRequestObject[kHeaders][kGuard] = this[kHeaders][kGuard]
     clonedRequestObject[kHeaders][kRealm] = this[kHeaders][kRealm]
@@ -48514,7 +43619,7 @@ const {
   isomorphicEncode
 } = __nccwpck_require__(52538)
 const {
-  redirectStatus,
+  redirectStatusSet,
   nullBodyStatus,
   DOMException
 } = __nccwpck_require__(41037)
@@ -48523,11 +43628,12 @@ const { webidl } = __nccwpck_require__(21744)
 const { FormData } = __nccwpck_require__(72015)
 const { getGlobalOrigin } = __nccwpck_require__(71246)
 const { URLSerializer } = __nccwpck_require__(685)
-const { kHeadersList } = __nccwpck_require__(72785)
+const { kHeadersList, kConstruct } = __nccwpck_require__(72785)
 const assert = __nccwpck_require__(39491)
 const { types } = __nccwpck_require__(73837)
 
 const ReadableStream = globalThis.ReadableStream || (__nccwpck_require__(35356).ReadableStream)
+const textEncoder = new TextEncoder('utf-8')
 
 // https://fetch.spec.whatwg.org/#response-class
 class Response {
@@ -48557,7 +43663,7 @@ class Response {
     }
 
     // 1. Let bytes the result of running serialize a JavaScript value to JSON bytes on data.
-    const bytes = new TextEncoder('utf-8').encode(
+    const bytes = textEncoder.encode(
       serializeJavascriptValueToJSONString(data)
     )
 
@@ -48602,7 +43708,7 @@ class Response {
     }
 
     // 3. If status is not a redirect status, then throw a RangeError.
-    if (!redirectStatus.includes(status)) {
+    if (!redirectStatusSet.has(status)) {
       throw new RangeError('Invalid status code ' + status)
     }
 
@@ -48643,7 +43749,7 @@ class Response {
     // 2. Set this’s headers to a new Headers object with this’s relevant
     // Realm, whose header list is this’s response’s header list and guard
     // is "response".
-    this[kHeaders] = new Headers()
+    this[kHeaders] = new Headers(kConstruct)
     this[kHeaders][kGuard] = 'response'
     this[kHeaders][kHeadersList] = this[kState].headersList
     this[kHeaders][kRealm] = this[kRealm]
@@ -49013,11 +44119,7 @@ webidl.converters.XMLHttpRequestBodyInit = function (V) {
     return webidl.converters.Blob(V, { strict: false })
   }
 
-  if (
-    types.isAnyArrayBuffer(V) ||
-    types.isTypedArray(V) ||
-    types.isDataView(V)
-  ) {
+  if (types.isArrayBuffer(V) || types.isTypedArray(V) || types.isDataView(V)) {
     return webidl.converters.BufferSource(V)
   }
 
@@ -49100,12 +44202,14 @@ module.exports = {
 "use strict";
 
 
-const { redirectStatus, badPorts, referrerPolicy: referrerPolicyTokens } = __nccwpck_require__(41037)
+const { redirectStatusSet, referrerPolicySet: referrerPolicyTokens, badPortsSet } = __nccwpck_require__(41037)
 const { getGlobalOrigin } = __nccwpck_require__(71246)
 const { performance } = __nccwpck_require__(4074)
 const { isBlobLike, toUSVString, ReadableStreamFrom } = __nccwpck_require__(83983)
 const assert = __nccwpck_require__(39491)
 const { isUint8Array } = __nccwpck_require__(29830)
+
+let supportedHashes = []
 
 // https://nodejs.org/api/crypto.html#determining-if-crypto-support-is-unavailable
 /** @type {import('crypto')|undefined} */
@@ -49113,8 +44217,10 @@ let crypto
 
 try {
   crypto = __nccwpck_require__(6113)
+  const possibleRelevantHashes = ['sha256', 'sha384', 'sha512']
+  supportedHashes = crypto.getHashes().filter((hash) => possibleRelevantHashes.includes(hash))
+/* c8 ignore next 3 */
 } catch {
-
 }
 
 function responseURL (response) {
@@ -49129,7 +44235,7 @@ function responseURL (response) {
 // https://fetch.spec.whatwg.org/#concept-response-location-url
 function responseLocationURL (response, requestFragment) {
   // 1. If response’s status is not a redirect status, then return null.
-  if (!redirectStatus.includes(response.status)) {
+  if (!redirectStatusSet.has(response.status)) {
     return null
   }
 
@@ -49164,7 +44270,7 @@ function requestBadPort (request) {
 
   // 2. If url’s scheme is an HTTP(S) scheme and url’s port is a bad port,
   // then return blocked.
-  if (urlIsHttpHttpsScheme(url) && badPorts.includes(url.port)) {
+  if (urlIsHttpHttpsScheme(url) && badPortsSet.has(url.port)) {
     return 'blocked'
   }
 
@@ -49203,52 +44309,57 @@ function isValidReasonPhrase (statusText) {
   return true
 }
 
-function isTokenChar (c) {
-  return !(
-    c >= 0x7f ||
-    c <= 0x20 ||
-    c === '(' ||
-    c === ')' ||
-    c === '<' ||
-    c === '>' ||
-    c === '@' ||
-    c === ',' ||
-    c === ';' ||
-    c === ':' ||
-    c === '\\' ||
-    c === '"' ||
-    c === '/' ||
-    c === '[' ||
-    c === ']' ||
-    c === '?' ||
-    c === '=' ||
-    c === '{' ||
-    c === '}'
-  )
+/**
+ * @see https://tools.ietf.org/html/rfc7230#section-3.2.6
+ * @param {number} c
+ */
+function isTokenCharCode (c) {
+  switch (c) {
+    case 0x22:
+    case 0x28:
+    case 0x29:
+    case 0x2c:
+    case 0x2f:
+    case 0x3a:
+    case 0x3b:
+    case 0x3c:
+    case 0x3d:
+    case 0x3e:
+    case 0x3f:
+    case 0x40:
+    case 0x5b:
+    case 0x5c:
+    case 0x5d:
+    case 0x7b:
+    case 0x7d:
+      // DQUOTE and "(),/:;<=>?@[\]{}"
+      return false
+    default:
+      // VCHAR %x21-7E
+      return c >= 0x21 && c <= 0x7e
+  }
 }
 
-// See RFC 7230, Section 3.2.6.
-// https://github.com/chromium/chromium/blob/d7da0240cae77824d1eda25745c4022757499131/third_party/blink/renderer/platform/network/http_parsers.cc#L321
+/**
+ * @param {string} characters
+ */
 function isValidHTTPToken (characters) {
-  if (!characters || typeof characters !== 'string') {
+  if (characters.length === 0) {
     return false
   }
   for (let i = 0; i < characters.length; ++i) {
-    const c = characters.charCodeAt(i)
-    if (c > 0x7f || !isTokenChar(c)) {
+    if (!isTokenCharCode(characters.charCodeAt(i))) {
       return false
     }
   }
   return true
 }
 
-// https://fetch.spec.whatwg.org/#header-name
-// https://github.com/chromium/chromium/blob/b3d37e6f94f87d59e44662d6078f6a12de845d17/net/http/http_util.cc#L342
+/**
+ * @see https://fetch.spec.whatwg.org/#header-name
+ * @param {string} potentialValue
+ */
 function isValidHeaderName (potentialValue) {
-  if (potentialValue.length === 0) {
-    return false
-  }
-
   return isValidHTTPToken(potentialValue)
 }
 
@@ -49306,7 +44417,7 @@ function setRequestReferrerPolicyOnRedirect (request, actualResponse) {
     // The left-most policy is the fallback.
     for (let i = policyHeader.length; i !== 0; i--) {
       const token = policyHeader[i - 1].trim()
-      if (referrerPolicyTokens.includes(token)) {
+      if (referrerPolicyTokens.has(token)) {
         policy = token
         break
       }
@@ -49637,66 +44748,56 @@ function bytesMatch (bytes, metadataList) {
     return true
   }
 
-  // 3. If parsedMetadata is the empty set, return true.
+  // 3. If response is not eligible for integrity validation, return false.
+  // TODO
+
+  // 4. If parsedMetadata is the empty set, return true.
   if (parsedMetadata.length === 0) {
     return true
   }
 
-  // 4. Let metadata be the result of getting the strongest
+  // 5. Let metadata be the result of getting the strongest
   //    metadata from parsedMetadata.
-  const list = parsedMetadata.sort((c, d) => d.algo.localeCompare(c.algo))
-  // get the strongest algorithm
-  const strongest = list[0].algo
-  // get all entries that use the strongest algorithm; ignore weaker
-  const metadata = list.filter((item) => item.algo === strongest)
+  const strongest = getStrongestMetadata(parsedMetadata)
+  const metadata = filterMetadataListByAlgorithm(parsedMetadata, strongest)
 
-  // 5. For each item in metadata:
+  // 6. For each item in metadata:
   for (const item of metadata) {
     // 1. Let algorithm be the alg component of item.
     const algorithm = item.algo
 
     // 2. Let expectedValue be the val component of item.
-    let expectedValue = item.hash
+    const expectedValue = item.hash
 
     // See https://github.com/web-platform-tests/wpt/commit/e4c5cc7a5e48093220528dfdd1c4012dc3837a0e
     // "be liberal with padding". This is annoying, and it's not even in the spec.
 
-    if (expectedValue.endsWith('==')) {
-      expectedValue = expectedValue.slice(0, -2)
-    }
-
     // 3. Let actualValue be the result of applying algorithm to bytes.
     let actualValue = crypto.createHash(algorithm).update(bytes).digest('base64')
 
-    if (actualValue.endsWith('==')) {
-      actualValue = actualValue.slice(0, -2)
+    if (actualValue[actualValue.length - 1] === '=') {
+      if (actualValue[actualValue.length - 2] === '=') {
+        actualValue = actualValue.slice(0, -2)
+      } else {
+        actualValue = actualValue.slice(0, -1)
+      }
     }
 
     // 4. If actualValue is a case-sensitive match for expectedValue,
     //    return true.
-    if (actualValue === expectedValue) {
-      return true
-    }
-
-    let actualBase64URL = crypto.createHash(algorithm).update(bytes).digest('base64url')
-
-    if (actualBase64URL.endsWith('==')) {
-      actualBase64URL = actualBase64URL.slice(0, -2)
-    }
-
-    if (actualBase64URL === expectedValue) {
+    if (compareBase64Mixed(actualValue, expectedValue)) {
       return true
     }
   }
 
-  // 6. Return false.
+  // 7. Return false.
   return false
 }
 
 // https://w3c.github.io/webappsec-subresource-integrity/#grammardef-hash-with-options
 // https://www.w3.org/TR/CSP2/#source-list-syntax
 // https://www.rfc-editor.org/rfc/rfc5234#appendix-B.1
-const parseHashWithOptions = /((?<algo>sha256|sha384|sha512)-(?<hash>[A-z0-9+/]{1}.*={0,2}))( +[\x21-\x7e]?)?/i
+const parseHashWithOptions = /(?<algo>sha256|sha384|sha512)-((?<hash>[A-Za-z0-9+/]+|[A-Za-z0-9_-]+)={0,2}(?:\s|$)( +[!-~]*)?)?/i
 
 /**
  * @see https://w3c.github.io/webappsec-subresource-integrity/#parse-metadata
@@ -49710,8 +44811,6 @@ function parseMetadata (metadata) {
   // 2. Let empty be equal to true.
   let empty = true
 
-  const supportedHashes = crypto.getHashes()
-
   // 3. For each token returned by splitting metadata on spaces:
   for (const token of metadata.split(' ')) {
     // 1. Set empty to false.
@@ -49721,7 +44820,11 @@ function parseMetadata (metadata) {
     const parsedToken = parseHashWithOptions.exec(token)
 
     // 3. If token does not parse, continue to the next token.
-    if (parsedToken === null || parsedToken.groups === undefined) {
+    if (
+      parsedToken === null ||
+      parsedToken.groups === undefined ||
+      parsedToken.groups.algo === undefined
+    ) {
       // Note: Chromium blocks the request at this point, but Firefox
       // gives a warning that an invalid integrity was given. The
       // correct behavior is to ignore these, and subsequently not
@@ -49730,11 +44833,11 @@ function parseMetadata (metadata) {
     }
 
     // 4. Let algorithm be the hash-algo component of token.
-    const algorithm = parsedToken.groups.algo
+    const algorithm = parsedToken.groups.algo.toLowerCase()
 
     // 5. If algorithm is a hash function recognized by the user
     //    agent, add the parsed token to result.
-    if (supportedHashes.includes(algorithm.toLowerCase())) {
+    if (supportedHashes.includes(algorithm)) {
       result.push(parsedToken.groups)
     }
   }
@@ -49745,6 +44848,82 @@ function parseMetadata (metadata) {
   }
 
   return result
+}
+
+/**
+ * @param {{ algo: 'sha256' | 'sha384' | 'sha512' }[]} metadataList
+ */
+function getStrongestMetadata (metadataList) {
+  // Let algorithm be the algo component of the first item in metadataList.
+  // Can be sha256
+  let algorithm = metadataList[0].algo
+  // If the algorithm is sha512, then it is the strongest
+  // and we can return immediately
+  if (algorithm[3] === '5') {
+    return algorithm
+  }
+
+  for (let i = 1; i < metadataList.length; ++i) {
+    const metadata = metadataList[i]
+    // If the algorithm is sha512, then it is the strongest
+    // and we can break the loop immediately
+    if (metadata.algo[3] === '5') {
+      algorithm = 'sha512'
+      break
+    // If the algorithm is sha384, then a potential sha256 or sha384 is ignored
+    } else if (algorithm[3] === '3') {
+      continue
+    // algorithm is sha256, check if algorithm is sha384 and if so, set it as
+    // the strongest
+    } else if (metadata.algo[3] === '3') {
+      algorithm = 'sha384'
+    }
+  }
+  return algorithm
+}
+
+function filterMetadataListByAlgorithm (metadataList, algorithm) {
+  if (metadataList.length === 1) {
+    return metadataList
+  }
+
+  let pos = 0
+  for (let i = 0; i < metadataList.length; ++i) {
+    if (metadataList[i].algo === algorithm) {
+      metadataList[pos++] = metadataList[i]
+    }
+  }
+
+  metadataList.length = pos
+
+  return metadataList
+}
+
+/**
+ * Compares two base64 strings, allowing for base64url
+ * in the second string.
+ *
+* @param {string} actualValue always base64
+ * @param {string} expectedValue base64 or base64url
+ * @returns {boolean}
+ */
+function compareBase64Mixed (actualValue, expectedValue) {
+  if (actualValue.length !== expectedValue.length) {
+    return false
+  }
+  for (let i = 0; i < actualValue.length; ++i) {
+    if (actualValue[i] !== expectedValue[i]) {
+      if (
+        (actualValue[i] === '+' && expectedValue[i] === '-') ||
+        (actualValue[i] === '/' && expectedValue[i] === '_')
+      ) {
+        continue
+      }
+      return false
+    }
+  }
+
+  return true
 }
 
 // https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-request
@@ -49793,11 +44972,30 @@ function isCancelled (fetchParams) {
     fetchParams.controller.state === 'terminated'
 }
 
-// https://fetch.spec.whatwg.org/#concept-method-normalize
+const normalizeMethodRecord = {
+  delete: 'DELETE',
+  DELETE: 'DELETE',
+  get: 'GET',
+  GET: 'GET',
+  head: 'HEAD',
+  HEAD: 'HEAD',
+  options: 'OPTIONS',
+  OPTIONS: 'OPTIONS',
+  post: 'POST',
+  POST: 'POST',
+  put: 'PUT',
+  PUT: 'PUT'
+}
+
+// Note: object prototypes should not be able to be referenced. e.g. `Object#hasOwnProperty`.
+Object.setPrototypeOf(normalizeMethodRecord, null)
+
+/**
+ * @see https://fetch.spec.whatwg.org/#concept-method-normalize
+ * @param {string} method
+ */
 function normalizeMethod (method) {
-  return /^(DELETE|GET|HEAD|OPTIONS|POST|PUT)$/i.test(method)
-    ? method.toUpperCase()
-    : method
+  return normalizeMethodRecord[method.toLowerCase()] ?? method
 }
 
 // https://infra.spec.whatwg.org/#serialize-a-javascript-value-to-a-json-string
@@ -50142,7 +45340,9 @@ module.exports = {
   urlIsLocal,
   urlHasHttpsScheme,
   urlIsHttpHttpsScheme,
-  readAllBytes
+  readAllBytes,
+  normalizeMethodRecord,
+  parseMetadata
 }
 
 
@@ -50581,12 +45781,10 @@ webidl.converters.ByteString = function (V) {
   // 2. If the value of any element of x is greater than
   //    255, then throw a TypeError.
   for (let index = 0; index < x.length; index++) {
-    const charCode = x.charCodeAt(index)
-
-    if (charCode > 255) {
+    if (x.charCodeAt(index) > 255) {
       throw new TypeError(
         'Cannot convert argument to a ByteString because the character at ' +
-        `index ${index} has a value of ${charCode} which is greater than 255.`
+        `index ${index} has a value of ${x.charCodeAt(index)} which is greater than 255.`
       )
     }
   }
@@ -52231,12 +47429,17 @@ function parseLocation (statusCode, headers) {
 
 // https://tools.ietf.org/html/rfc7231#section-6.4.4
 function shouldRemoveHeader (header, removeContent, unknownOrigin) {
-  return (
-    (header.length === 4 && header.toString().toLowerCase() === 'host') ||
-    (removeContent && header.toString().toLowerCase().indexOf('content-') === 0) ||
-    (unknownOrigin && header.length === 13 && header.toString().toLowerCase() === 'authorization') ||
-    (unknownOrigin && header.length === 6 && header.toString().toLowerCase() === 'cookie')
-  )
+  if (header.length === 4) {
+    return util.headerNameToString(header) === 'host'
+  }
+  if (removeContent && util.headerNameToString(header).startsWith('content-')) {
+    return true
+  }
+  if (unknownOrigin && (header.length === 13 || header.length === 6 || header.length === 19)) {
+    const name = util.headerNameToString(header)
+    return name === 'authorization' || name === 'cookie' || name === 'proxy-authorization'
+  }
+  return false
 }
 
 // https://tools.ietf.org/html/rfc7231#section-6.4
@@ -52261,6 +47464,349 @@ function cleanRequestHeaders (headers, removeContent, unknownOrigin) {
 }
 
 module.exports = RedirectHandler
+
+
+/***/ }),
+
+/***/ 82286:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+const assert = __nccwpck_require__(39491)
+
+const { kRetryHandlerDefaultRetry } = __nccwpck_require__(72785)
+const { RequestRetryError } = __nccwpck_require__(48045)
+const { isDisturbed, parseHeaders, parseRangeHeader } = __nccwpck_require__(83983)
+
+function calculateRetryAfterHeader (retryAfter) {
+  const current = Date.now()
+  const diff = new Date(retryAfter).getTime() - current
+
+  return diff
+}
+
+class RetryHandler {
+  constructor (opts, handlers) {
+    const { retryOptions, ...dispatchOpts } = opts
+    const {
+      // Retry scoped
+      retry: retryFn,
+      maxRetries,
+      maxTimeout,
+      minTimeout,
+      timeoutFactor,
+      // Response scoped
+      methods,
+      errorCodes,
+      retryAfter,
+      statusCodes
+    } = retryOptions ?? {}
+
+    this.dispatch = handlers.dispatch
+    this.handler = handlers.handler
+    this.opts = dispatchOpts
+    this.abort = null
+    this.aborted = false
+    this.retryOpts = {
+      retry: retryFn ?? RetryHandler[kRetryHandlerDefaultRetry],
+      retryAfter: retryAfter ?? true,
+      maxTimeout: maxTimeout ?? 30 * 1000, // 30s,
+      timeout: minTimeout ?? 500, // .5s
+      timeoutFactor: timeoutFactor ?? 2,
+      maxRetries: maxRetries ?? 5,
+      // What errors we should retry
+      methods: methods ?? ['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE', 'TRACE'],
+      // Indicates which errors to retry
+      statusCodes: statusCodes ?? [500, 502, 503, 504, 429],
+      // List of errors to retry
+      errorCodes: errorCodes ?? [
+        'ECONNRESET',
+        'ECONNREFUSED',
+        'ENOTFOUND',
+        'ENETDOWN',
+        'ENETUNREACH',
+        'EHOSTDOWN',
+        'EHOSTUNREACH',
+        'EPIPE'
+      ]
+    }
+
+    this.retryCount = 0
+    this.start = 0
+    this.end = null
+    this.etag = null
+    this.resume = null
+
+    // Handle possible onConnect duplication
+    this.handler.onConnect(reason => {
+      this.aborted = true
+      if (this.abort) {
+        this.abort(reason)
+      } else {
+        this.reason = reason
+      }
+    })
+  }
+
+  onRequestSent () {
+    if (this.handler.onRequestSent) {
+      this.handler.onRequestSent()
+    }
+  }
+
+  onUpgrade (statusCode, headers, socket) {
+    if (this.handler.onUpgrade) {
+      this.handler.onUpgrade(statusCode, headers, socket)
+    }
+  }
+
+  onConnect (abort) {
+    if (this.aborted) {
+      abort(this.reason)
+    } else {
+      this.abort = abort
+    }
+  }
+
+  onBodySent (chunk) {
+    if (this.handler.onBodySent) return this.handler.onBodySent(chunk)
+  }
+
+  static [kRetryHandlerDefaultRetry] (err, { state, opts }, cb) {
+    const { statusCode, code, headers } = err
+    const { method, retryOptions } = opts
+    const {
+      maxRetries,
+      timeout,
+      maxTimeout,
+      timeoutFactor,
+      statusCodes,
+      errorCodes,
+      methods
+    } = retryOptions
+    let { counter, currentTimeout } = state
+
+    currentTimeout =
+      currentTimeout != null && currentTimeout > 0 ? currentTimeout : timeout
+
+    // Any code that is not a Undici's originated and allowed to retry
+    if (
+      code &&
+      code !== 'UND_ERR_REQ_RETRY' &&
+      code !== 'UND_ERR_SOCKET' &&
+      !errorCodes.includes(code)
+    ) {
+      cb(err)
+      return
+    }
+
+    // If a set of method are provided and the current method is not in the list
+    if (Array.isArray(methods) && !methods.includes(method)) {
+      cb(err)
+      return
+    }
+
+    // If a set of status code are provided and the current status code is not in the list
+    if (
+      statusCode != null &&
+      Array.isArray(statusCodes) &&
+      !statusCodes.includes(statusCode)
+    ) {
+      cb(err)
+      return
+    }
+
+    // If we reached the max number of retries
+    if (counter > maxRetries) {
+      cb(err)
+      return
+    }
+
+    let retryAfterHeader = headers != null && headers['retry-after']
+    if (retryAfterHeader) {
+      retryAfterHeader = Number(retryAfterHeader)
+      retryAfterHeader = isNaN(retryAfterHeader)
+        ? calculateRetryAfterHeader(retryAfterHeader)
+        : retryAfterHeader * 1e3 // Retry-After is in seconds
+    }
+
+    const retryTimeout =
+      retryAfterHeader > 0
+        ? Math.min(retryAfterHeader, maxTimeout)
+        : Math.min(currentTimeout * timeoutFactor ** counter, maxTimeout)
+
+    state.currentTimeout = retryTimeout
+
+    setTimeout(() => cb(null), retryTimeout)
+  }
+
+  onHeaders (statusCode, rawHeaders, resume, statusMessage) {
+    const headers = parseHeaders(rawHeaders)
+
+    this.retryCount += 1
+
+    if (statusCode >= 300) {
+      this.abort(
+        new RequestRetryError('Request failed', statusCode, {
+          headers,
+          count: this.retryCount
+        })
+      )
+      return false
+    }
+
+    // Checkpoint for resume from where we left it
+    if (this.resume != null) {
+      this.resume = null
+
+      if (statusCode !== 206) {
+        return true
+      }
+
+      const contentRange = parseRangeHeader(headers['content-range'])
+      // If no content range
+      if (!contentRange) {
+        this.abort(
+          new RequestRetryError('Content-Range mismatch', statusCode, {
+            headers,
+            count: this.retryCount
+          })
+        )
+        return false
+      }
+
+      // Let's start with a weak etag check
+      if (this.etag != null && this.etag !== headers.etag) {
+        this.abort(
+          new RequestRetryError('ETag mismatch', statusCode, {
+            headers,
+            count: this.retryCount
+          })
+        )
+        return false
+      }
+
+      const { start, size, end = size } = contentRange
+
+      assert(this.start === start, 'content-range mismatch')
+      assert(this.end == null || this.end === end, 'content-range mismatch')
+
+      this.resume = resume
+      return true
+    }
+
+    if (this.end == null) {
+      if (statusCode === 206) {
+        // First time we receive 206
+        const range = parseRangeHeader(headers['content-range'])
+
+        if (range == null) {
+          return this.handler.onHeaders(
+            statusCode,
+            rawHeaders,
+            resume,
+            statusMessage
+          )
+        }
+
+        const { start, size, end = size } = range
+
+        assert(
+          start != null && Number.isFinite(start) && this.start !== start,
+          'content-range mismatch'
+        )
+        assert(Number.isFinite(start))
+        assert(
+          end != null && Number.isFinite(end) && this.end !== end,
+          'invalid content-length'
+        )
+
+        this.start = start
+        this.end = end
+      }
+
+      // We make our best to checkpoint the body for further range headers
+      if (this.end == null) {
+        const contentLength = headers['content-length']
+        this.end = contentLength != null ? Number(contentLength) : null
+      }
+
+      assert(Number.isFinite(this.start))
+      assert(
+        this.end == null || Number.isFinite(this.end),
+        'invalid content-length'
+      )
+
+      this.resume = resume
+      this.etag = headers.etag != null ? headers.etag : null
+
+      return this.handler.onHeaders(
+        statusCode,
+        rawHeaders,
+        resume,
+        statusMessage
+      )
+    }
+
+    const err = new RequestRetryError('Request failed', statusCode, {
+      headers,
+      count: this.retryCount
+    })
+
+    this.abort(err)
+
+    return false
+  }
+
+  onData (chunk) {
+    this.start += chunk.length
+
+    return this.handler.onData(chunk)
+  }
+
+  onComplete (rawTrailers) {
+    this.retryCount = 0
+    return this.handler.onComplete(rawTrailers)
+  }
+
+  onError (err) {
+    if (this.aborted || isDisturbed(this.opts.body)) {
+      return this.handler.onError(err)
+    }
+
+    this.retryOpts.retry(
+      err,
+      {
+        state: { counter: this.retryCount++, currentTimeout: this.retryAfter },
+        opts: { retryOptions: this.retryOpts, ...this.opts }
+      },
+      onRetry.bind(this)
+    )
+
+    function onRetry (err) {
+      if (err != null || this.aborted || isDisturbed(this.opts.body)) {
+        return this.handler.onError(err)
+      }
+
+      if (this.start !== 0) {
+        this.opts = {
+          ...this.opts,
+          headers: {
+            ...this.opts.headers,
+            range: `bytes=${this.start}-${this.end ?? ''}`
+          }
+        }
+      }
+
+      try {
+        this.dispatch(this.opts, this)
+      } catch (err) {
+        this.handler.onError(err)
+      }
+    }
+  }
+}
+
+module.exports = RetryHandler
 
 
 /***/ }),
@@ -54075,7 +49621,7 @@ class Pool extends PoolBase {
         maxCachedSessions,
         allowH2,
         socketPath,
-        timeout: connectTimeout == null ? 10e3 : connectTimeout,
+        timeout: connectTimeout,
         ...(util.nodeHasAutoSelectFamily && autoSelectFamily ? { autoSelectFamily, autoSelectFamilyAttemptTimeout } : undefined),
         ...connect
       })
@@ -54185,6 +49731,9 @@ class ProxyAgent extends DispatcherBase {
     this[kProxyTls] = opts.proxyTls
     this[kProxyHeaders] = opts.headers || {}
 
+    const resolvedUrl = new URL(opts.uri)
+    const { origin, port, host, username, password } = resolvedUrl
+
     if (opts.auth && opts.token) {
       throw new InvalidArgumentError('opts.auth cannot be used in combination with opts.token')
     } else if (opts.auth) {
@@ -54192,10 +49741,9 @@ class ProxyAgent extends DispatcherBase {
       this[kProxyHeaders]['proxy-authorization'] = `Basic ${opts.auth}`
     } else if (opts.token) {
       this[kProxyHeaders]['proxy-authorization'] = opts.token
+    } else if (username && password) {
+      this[kProxyHeaders]['proxy-authorization'] = `Basic ${Buffer.from(`${decodeURIComponent(username)}:${decodeURIComponent(password)}`).toString('base64')}`
     }
-
-    const resolvedUrl = new URL(opts.uri)
-    const { origin, port, host } = resolvedUrl
 
     const connect = buildConnector({ ...opts.proxyTls })
     this[kConnectEndpoint] = buildConnector({ ...opts.requestTls })
@@ -54220,7 +49768,7 @@ class ProxyAgent extends DispatcherBase {
           })
           if (statusCode !== 200) {
             socket.on('error', () => {}).destroy()
-            callback(new RequestAbortedError('Proxy response !== 200 when HTTP Tunneling'))
+            callback(new RequestAbortedError(`Proxy response (${statusCode}) !== 200 when HTTP Tunneling`))
           }
           if (opts.protocol !== 'https:') {
             callback(null, socket)
@@ -56517,7 +52065,7 @@ function getUserAgent() {
     return navigator.userAgent;
   }
 
-  if (typeof process === "object" && "version" in process) {
+  if (typeof process === "object" && process.version !== undefined) {
     return `Node.js/${process.version.substr(1)} (${process.platform}; ${process.arch})`;
   }
 
@@ -57437,6 +52985,1625 @@ module.exports = require("worker_threads");
 
 "use strict";
 module.exports = require("zlib");
+
+/***/ }),
+
+/***/ 92960:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+const WritableStream = (__nccwpck_require__(84492).Writable)
+const inherits = (__nccwpck_require__(47261).inherits)
+
+const StreamSearch = __nccwpck_require__(51142)
+
+const PartStream = __nccwpck_require__(81620)
+const HeaderParser = __nccwpck_require__(92032)
+
+const DASH = 45
+const B_ONEDASH = Buffer.from('-')
+const B_CRLF = Buffer.from('\r\n')
+const EMPTY_FN = function () {}
+
+function Dicer (cfg) {
+  if (!(this instanceof Dicer)) { return new Dicer(cfg) }
+  WritableStream.call(this, cfg)
+
+  if (!cfg || (!cfg.headerFirst && typeof cfg.boundary !== 'string')) { throw new TypeError('Boundary required') }
+
+  if (typeof cfg.boundary === 'string') { this.setBoundary(cfg.boundary) } else { this._bparser = undefined }
+
+  this._headerFirst = cfg.headerFirst
+
+  this._dashes = 0
+  this._parts = 0
+  this._finished = false
+  this._realFinish = false
+  this._isPreamble = true
+  this._justMatched = false
+  this._firstWrite = true
+  this._inHeader = true
+  this._part = undefined
+  this._cb = undefined
+  this._ignoreData = false
+  this._partOpts = { highWaterMark: cfg.partHwm }
+  this._pause = false
+
+  const self = this
+  this._hparser = new HeaderParser(cfg)
+  this._hparser.on('header', function (header) {
+    self._inHeader = false
+    self._part.emit('header', header)
+  })
+}
+inherits(Dicer, WritableStream)
+
+Dicer.prototype.emit = function (ev) {
+  if (ev === 'finish' && !this._realFinish) {
+    if (!this._finished) {
+      const self = this
+      process.nextTick(function () {
+        self.emit('error', new Error('Unexpected end of multipart data'))
+        if (self._part && !self._ignoreData) {
+          const type = (self._isPreamble ? 'Preamble' : 'Part')
+          self._part.emit('error', new Error(type + ' terminated early due to unexpected end of multipart data'))
+          self._part.push(null)
+          process.nextTick(function () {
+            self._realFinish = true
+            self.emit('finish')
+            self._realFinish = false
+          })
+          return
+        }
+        self._realFinish = true
+        self.emit('finish')
+        self._realFinish = false
+      })
+    }
+  } else { WritableStream.prototype.emit.apply(this, arguments) }
+}
+
+Dicer.prototype._write = function (data, encoding, cb) {
+  // ignore unexpected data (e.g. extra trailer data after finished)
+  if (!this._hparser && !this._bparser) { return cb() }
+
+  if (this._headerFirst && this._isPreamble) {
+    if (!this._part) {
+      this._part = new PartStream(this._partOpts)
+      if (this._events.preamble) { this.emit('preamble', this._part) } else { this._ignore() }
+    }
+    const r = this._hparser.push(data)
+    if (!this._inHeader && r !== undefined && r < data.length) { data = data.slice(r) } else { return cb() }
+  }
+
+  // allows for "easier" testing
+  if (this._firstWrite) {
+    this._bparser.push(B_CRLF)
+    this._firstWrite = false
+  }
+
+  this._bparser.push(data)
+
+  if (this._pause) { this._cb = cb } else { cb() }
+}
+
+Dicer.prototype.reset = function () {
+  this._part = undefined
+  this._bparser = undefined
+  this._hparser = undefined
+}
+
+Dicer.prototype.setBoundary = function (boundary) {
+  const self = this
+  this._bparser = new StreamSearch('\r\n--' + boundary)
+  this._bparser.on('info', function (isMatch, data, start, end) {
+    self._oninfo(isMatch, data, start, end)
+  })
+}
+
+Dicer.prototype._ignore = function () {
+  if (this._part && !this._ignoreData) {
+    this._ignoreData = true
+    this._part.on('error', EMPTY_FN)
+    // we must perform some kind of read on the stream even though we are
+    // ignoring the data, otherwise node's Readable stream will not emit 'end'
+    // after pushing null to the stream
+    this._part.resume()
+  }
+}
+
+Dicer.prototype._oninfo = function (isMatch, data, start, end) {
+  let buf; const self = this; let i = 0; let r; let shouldWriteMore = true
+
+  if (!this._part && this._justMatched && data) {
+    while (this._dashes < 2 && (start + i) < end) {
+      if (data[start + i] === DASH) {
+        ++i
+        ++this._dashes
+      } else {
+        if (this._dashes) { buf = B_ONEDASH }
+        this._dashes = 0
+        break
+      }
+    }
+    if (this._dashes === 2) {
+      if ((start + i) < end && this._events.trailer) { this.emit('trailer', data.slice(start + i, end)) }
+      this.reset()
+      this._finished = true
+      // no more parts will be added
+      if (self._parts === 0) {
+        self._realFinish = true
+        self.emit('finish')
+        self._realFinish = false
+      }
+    }
+    if (this._dashes) { return }
+  }
+  if (this._justMatched) { this._justMatched = false }
+  if (!this._part) {
+    this._part = new PartStream(this._partOpts)
+    this._part._read = function (n) {
+      self._unpause()
+    }
+    if (this._isPreamble && this._events.preamble) { this.emit('preamble', this._part) } else if (this._isPreamble !== true && this._events.part) { this.emit('part', this._part) } else { this._ignore() }
+    if (!this._isPreamble) { this._inHeader = true }
+  }
+  if (data && start < end && !this._ignoreData) {
+    if (this._isPreamble || !this._inHeader) {
+      if (buf) { shouldWriteMore = this._part.push(buf) }
+      shouldWriteMore = this._part.push(data.slice(start, end))
+      if (!shouldWriteMore) { this._pause = true }
+    } else if (!this._isPreamble && this._inHeader) {
+      if (buf) { this._hparser.push(buf) }
+      r = this._hparser.push(data.slice(start, end))
+      if (!this._inHeader && r !== undefined && r < end) { this._oninfo(false, data, start + r, end) }
+    }
+  }
+  if (isMatch) {
+    this._hparser.reset()
+    if (this._isPreamble) { this._isPreamble = false } else {
+      if (start !== end) {
+        ++this._parts
+        this._part.on('end', function () {
+          if (--self._parts === 0) {
+            if (self._finished) {
+              self._realFinish = true
+              self.emit('finish')
+              self._realFinish = false
+            } else {
+              self._unpause()
+            }
+          }
+        })
+      }
+    }
+    this._part.push(null)
+    this._part = undefined
+    this._ignoreData = false
+    this._justMatched = true
+    this._dashes = 0
+  }
+}
+
+Dicer.prototype._unpause = function () {
+  if (!this._pause) { return }
+
+  this._pause = false
+  if (this._cb) {
+    const cb = this._cb
+    this._cb = undefined
+    cb()
+  }
+}
+
+module.exports = Dicer
+
+
+/***/ }),
+
+/***/ 92032:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+const EventEmitter = (__nccwpck_require__(15673).EventEmitter)
+const inherits = (__nccwpck_require__(47261).inherits)
+const getLimit = __nccwpck_require__(21467)
+
+const StreamSearch = __nccwpck_require__(51142)
+
+const B_DCRLF = Buffer.from('\r\n\r\n')
+const RE_CRLF = /\r\n/g
+const RE_HDR = /^([^:]+):[ \t]?([\x00-\xFF]+)?$/ // eslint-disable-line no-control-regex
+
+function HeaderParser (cfg) {
+  EventEmitter.call(this)
+
+  cfg = cfg || {}
+  const self = this
+  this.nread = 0
+  this.maxed = false
+  this.npairs = 0
+  this.maxHeaderPairs = getLimit(cfg, 'maxHeaderPairs', 2000)
+  this.maxHeaderSize = getLimit(cfg, 'maxHeaderSize', 80 * 1024)
+  this.buffer = ''
+  this.header = {}
+  this.finished = false
+  this.ss = new StreamSearch(B_DCRLF)
+  this.ss.on('info', function (isMatch, data, start, end) {
+    if (data && !self.maxed) {
+      if (self.nread + end - start >= self.maxHeaderSize) {
+        end = self.maxHeaderSize - self.nread + start
+        self.nread = self.maxHeaderSize
+        self.maxed = true
+      } else { self.nread += (end - start) }
+
+      self.buffer += data.toString('binary', start, end)
+    }
+    if (isMatch) { self._finish() }
+  })
+}
+inherits(HeaderParser, EventEmitter)
+
+HeaderParser.prototype.push = function (data) {
+  const r = this.ss.push(data)
+  if (this.finished) { return r }
+}
+
+HeaderParser.prototype.reset = function () {
+  this.finished = false
+  this.buffer = ''
+  this.header = {}
+  this.ss.reset()
+}
+
+HeaderParser.prototype._finish = function () {
+  if (this.buffer) { this._parseHeader() }
+  this.ss.matches = this.ss.maxMatches
+  const header = this.header
+  this.header = {}
+  this.buffer = ''
+  this.finished = true
+  this.nread = this.npairs = 0
+  this.maxed = false
+  this.emit('header', header)
+}
+
+HeaderParser.prototype._parseHeader = function () {
+  if (this.npairs === this.maxHeaderPairs) { return }
+
+  const lines = this.buffer.split(RE_CRLF)
+  const len = lines.length
+  let m, h
+
+  for (var i = 0; i < len; ++i) { // eslint-disable-line no-var
+    if (lines[i].length === 0) { continue }
+    if (lines[i][0] === '\t' || lines[i][0] === ' ') {
+      // folded header content
+      // RFC2822 says to just remove the CRLF and not the whitespace following
+      // it, so we follow the RFC and include the leading whitespace ...
+      if (h) {
+        this.header[h][this.header[h].length - 1] += lines[i]
+        continue
+      }
+    }
+
+    const posColon = lines[i].indexOf(':')
+    if (
+      posColon === -1 ||
+      posColon === 0
+    ) {
+      return
+    }
+    m = RE_HDR.exec(lines[i])
+    h = m[1].toLowerCase()
+    this.header[h] = this.header[h] || []
+    this.header[h].push((m[2] || ''))
+    if (++this.npairs === this.maxHeaderPairs) { break }
+  }
+}
+
+module.exports = HeaderParser
+
+
+/***/ }),
+
+/***/ 81620:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+const inherits = (__nccwpck_require__(47261).inherits)
+const ReadableStream = (__nccwpck_require__(84492).Readable)
+
+function PartStream (opts) {
+  ReadableStream.call(this, opts)
+}
+inherits(PartStream, ReadableStream)
+
+PartStream.prototype._read = function (n) {}
+
+module.exports = PartStream
+
+
+/***/ }),
+
+/***/ 51142:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+/**
+ * Copyright Brian White. All rights reserved.
+ *
+ * @see https://github.com/mscdex/streamsearch
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ * Based heavily on the Streaming Boyer-Moore-Horspool C++ implementation
+ * by Hongli Lai at: https://github.com/FooBarWidget/boyer-moore-horspool
+ */
+const EventEmitter = (__nccwpck_require__(15673).EventEmitter)
+const inherits = (__nccwpck_require__(47261).inherits)
+
+function SBMH (needle) {
+  if (typeof needle === 'string') {
+    needle = Buffer.from(needle)
+  }
+
+  if (!Buffer.isBuffer(needle)) {
+    throw new TypeError('The needle has to be a String or a Buffer.')
+  }
+
+  const needleLength = needle.length
+
+  if (needleLength === 0) {
+    throw new Error('The needle cannot be an empty String/Buffer.')
+  }
+
+  if (needleLength > 256) {
+    throw new Error('The needle cannot have a length bigger than 256.')
+  }
+
+  this.maxMatches = Infinity
+  this.matches = 0
+
+  this._occ = new Array(256)
+    .fill(needleLength) // Initialize occurrence table.
+  this._lookbehind_size = 0
+  this._needle = needle
+  this._bufpos = 0
+
+  this._lookbehind = Buffer.alloc(needleLength)
+
+  // Populate occurrence table with analysis of the needle,
+  // ignoring last letter.
+  for (var i = 0; i < needleLength - 1; ++i) { // eslint-disable-line no-var
+    this._occ[needle[i]] = needleLength - 1 - i
+  }
+}
+inherits(SBMH, EventEmitter)
+
+SBMH.prototype.reset = function () {
+  this._lookbehind_size = 0
+  this.matches = 0
+  this._bufpos = 0
+}
+
+SBMH.prototype.push = function (chunk, pos) {
+  if (!Buffer.isBuffer(chunk)) {
+    chunk = Buffer.from(chunk, 'binary')
+  }
+  const chlen = chunk.length
+  this._bufpos = pos || 0
+  let r
+  while (r !== chlen && this.matches < this.maxMatches) { r = this._sbmh_feed(chunk) }
+  return r
+}
+
+SBMH.prototype._sbmh_feed = function (data) {
+  const len = data.length
+  const needle = this._needle
+  const needleLength = needle.length
+  const lastNeedleChar = needle[needleLength - 1]
+
+  // Positive: points to a position in `data`
+  //           pos == 3 points to data[3]
+  // Negative: points to a position in the lookbehind buffer
+  //           pos == -2 points to lookbehind[lookbehind_size - 2]
+  let pos = -this._lookbehind_size
+  let ch
+
+  if (pos < 0) {
+    // Lookbehind buffer is not empty. Perform Boyer-Moore-Horspool
+    // search with character lookup code that considers both the
+    // lookbehind buffer and the current round's haystack data.
+    //
+    // Loop until
+    //   there is a match.
+    // or until
+    //   we've moved past the position that requires the
+    //   lookbehind buffer. In this case we switch to the
+    //   optimized loop.
+    // or until
+    //   the character to look at lies outside the haystack.
+    while (pos < 0 && pos <= len - needleLength) {
+      ch = this._sbmh_lookup_char(data, pos + needleLength - 1)
+
+      if (
+        ch === lastNeedleChar &&
+        this._sbmh_memcmp(data, pos, needleLength - 1)
+      ) {
+        this._lookbehind_size = 0
+        ++this.matches
+        this.emit('info', true)
+
+        return (this._bufpos = pos + needleLength)
+      }
+      pos += this._occ[ch]
+    }
+
+    // No match.
+
+    if (pos < 0) {
+      // There's too few data for Boyer-Moore-Horspool to run,
+      // so let's use a different algorithm to skip as much as
+      // we can.
+      // Forward pos until
+      //   the trailing part of lookbehind + data
+      //   looks like the beginning of the needle
+      // or until
+      //   pos == 0
+      while (pos < 0 && !this._sbmh_memcmp(data, pos, len - pos)) { ++pos }
+    }
+
+    if (pos >= 0) {
+      // Discard lookbehind buffer.
+      this.emit('info', false, this._lookbehind, 0, this._lookbehind_size)
+      this._lookbehind_size = 0
+    } else {
+      // Cut off part of the lookbehind buffer that has
+      // been processed and append the entire haystack
+      // into it.
+      const bytesToCutOff = this._lookbehind_size + pos
+      if (bytesToCutOff > 0) {
+        // The cut off data is guaranteed not to contain the needle.
+        this.emit('info', false, this._lookbehind, 0, bytesToCutOff)
+      }
+
+      this._lookbehind.copy(this._lookbehind, 0, bytesToCutOff,
+        this._lookbehind_size - bytesToCutOff)
+      this._lookbehind_size -= bytesToCutOff
+
+      data.copy(this._lookbehind, this._lookbehind_size)
+      this._lookbehind_size += len
+
+      this._bufpos = len
+      return len
+    }
+  }
+
+  pos += (pos >= 0) * this._bufpos
+
+  // Lookbehind buffer is now empty. We only need to check if the
+  // needle is in the haystack.
+  if (data.indexOf(needle, pos) !== -1) {
+    pos = data.indexOf(needle, pos)
+    ++this.matches
+    if (pos > 0) { this.emit('info', true, data, this._bufpos, pos) } else { this.emit('info', true) }
+
+    return (this._bufpos = pos + needleLength)
+  } else {
+    pos = len - needleLength
+  }
+
+  // There was no match. If there's trailing haystack data that we cannot
+  // match yet using the Boyer-Moore-Horspool algorithm (because the trailing
+  // data is less than the needle size) then match using a modified
+  // algorithm that starts matching from the beginning instead of the end.
+  // Whatever trailing data is left after running this algorithm is added to
+  // the lookbehind buffer.
+  while (
+    pos < len &&
+    (
+      data[pos] !== needle[0] ||
+      (
+        (Buffer.compare(
+          data.subarray(pos, pos + len - pos),
+          needle.subarray(0, len - pos)
+        ) !== 0)
+      )
+    )
+  ) {
+    ++pos
+  }
+  if (pos < len) {
+    data.copy(this._lookbehind, 0, pos, pos + (len - pos))
+    this._lookbehind_size = len - pos
+  }
+
+  // Everything until pos is guaranteed not to contain needle data.
+  if (pos > 0) { this.emit('info', false, data, this._bufpos, pos < len ? pos : len) }
+
+  this._bufpos = len
+  return len
+}
+
+SBMH.prototype._sbmh_lookup_char = function (data, pos) {
+  return (pos < 0)
+    ? this._lookbehind[this._lookbehind_size + pos]
+    : data[pos]
+}
+
+SBMH.prototype._sbmh_memcmp = function (data, pos, len) {
+  for (var i = 0; i < len; ++i) { // eslint-disable-line no-var
+    if (this._sbmh_lookup_char(data, pos + i) !== this._needle[i]) { return false }
+  }
+  return true
+}
+
+module.exports = SBMH
+
+
+/***/ }),
+
+/***/ 50727:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+const WritableStream = (__nccwpck_require__(84492).Writable)
+const { inherits } = __nccwpck_require__(47261)
+const Dicer = __nccwpck_require__(92960)
+
+const MultipartParser = __nccwpck_require__(32183)
+const UrlencodedParser = __nccwpck_require__(78306)
+const parseParams = __nccwpck_require__(31854)
+
+function Busboy (opts) {
+  if (!(this instanceof Busboy)) { return new Busboy(opts) }
+
+  if (typeof opts !== 'object') {
+    throw new TypeError('Busboy expected an options-Object.')
+  }
+  if (typeof opts.headers !== 'object') {
+    throw new TypeError('Busboy expected an options-Object with headers-attribute.')
+  }
+  if (typeof opts.headers['content-type'] !== 'string') {
+    throw new TypeError('Missing Content-Type-header.')
+  }
+
+  const {
+    headers,
+    ...streamOptions
+  } = opts
+
+  this.opts = {
+    autoDestroy: false,
+    ...streamOptions
+  }
+  WritableStream.call(this, this.opts)
+
+  this._done = false
+  this._parser = this.getParserByHeaders(headers)
+  this._finished = false
+}
+inherits(Busboy, WritableStream)
+
+Busboy.prototype.emit = function (ev) {
+  if (ev === 'finish') {
+    if (!this._done) {
+      this._parser?.end()
+      return
+    } else if (this._finished) {
+      return
+    }
+    this._finished = true
+  }
+  WritableStream.prototype.emit.apply(this, arguments)
+}
+
+Busboy.prototype.getParserByHeaders = function (headers) {
+  const parsed = parseParams(headers['content-type'])
+
+  const cfg = {
+    defCharset: this.opts.defCharset,
+    fileHwm: this.opts.fileHwm,
+    headers,
+    highWaterMark: this.opts.highWaterMark,
+    isPartAFile: this.opts.isPartAFile,
+    limits: this.opts.limits,
+    parsedConType: parsed,
+    preservePath: this.opts.preservePath
+  }
+
+  if (MultipartParser.detect.test(parsed[0])) {
+    return new MultipartParser(this, cfg)
+  }
+  if (UrlencodedParser.detect.test(parsed[0])) {
+    return new UrlencodedParser(this, cfg)
+  }
+  throw new Error('Unsupported Content-Type.')
+}
+
+Busboy.prototype._write = function (chunk, encoding, cb) {
+  this._parser.write(chunk, cb)
+}
+
+module.exports = Busboy
+module.exports["default"] = Busboy
+module.exports.Busboy = Busboy
+
+module.exports.Dicer = Dicer
+
+
+/***/ }),
+
+/***/ 32183:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+// TODO:
+//  * support 1 nested multipart level
+//    (see second multipart example here:
+//     http://www.w3.org/TR/html401/interact/forms.html#didx-multipartform-data)
+//  * support limits.fieldNameSize
+//     -- this will require modifications to utils.parseParams
+
+const { Readable } = __nccwpck_require__(84492)
+const { inherits } = __nccwpck_require__(47261)
+
+const Dicer = __nccwpck_require__(92960)
+
+const parseParams = __nccwpck_require__(31854)
+const decodeText = __nccwpck_require__(84619)
+const basename = __nccwpck_require__(48647)
+const getLimit = __nccwpck_require__(21467)
+
+const RE_BOUNDARY = /^boundary$/i
+const RE_FIELD = /^form-data$/i
+const RE_CHARSET = /^charset$/i
+const RE_FILENAME = /^filename$/i
+const RE_NAME = /^name$/i
+
+Multipart.detect = /^multipart\/form-data/i
+function Multipart (boy, cfg) {
+  let i
+  let len
+  const self = this
+  let boundary
+  const limits = cfg.limits
+  const isPartAFile = cfg.isPartAFile || ((fieldName, contentType, fileName) => (contentType === 'application/octet-stream' || fileName !== undefined))
+  const parsedConType = cfg.parsedConType || []
+  const defCharset = cfg.defCharset || 'utf8'
+  const preservePath = cfg.preservePath
+  const fileOpts = { highWaterMark: cfg.fileHwm }
+
+  for (i = 0, len = parsedConType.length; i < len; ++i) {
+    if (Array.isArray(parsedConType[i]) &&
+      RE_BOUNDARY.test(parsedConType[i][0])) {
+      boundary = parsedConType[i][1]
+      break
+    }
+  }
+
+  function checkFinished () {
+    if (nends === 0 && finished && !boy._done) {
+      finished = false
+      self.end()
+    }
+  }
+
+  if (typeof boundary !== 'string') { throw new Error('Multipart: Boundary not found') }
+
+  const fieldSizeLimit = getLimit(limits, 'fieldSize', 1 * 1024 * 1024)
+  const fileSizeLimit = getLimit(limits, 'fileSize', Infinity)
+  const filesLimit = getLimit(limits, 'files', Infinity)
+  const fieldsLimit = getLimit(limits, 'fields', Infinity)
+  const partsLimit = getLimit(limits, 'parts', Infinity)
+  const headerPairsLimit = getLimit(limits, 'headerPairs', 2000)
+  const headerSizeLimit = getLimit(limits, 'headerSize', 80 * 1024)
+
+  let nfiles = 0
+  let nfields = 0
+  let nends = 0
+  let curFile
+  let curField
+  let finished = false
+
+  this._needDrain = false
+  this._pause = false
+  this._cb = undefined
+  this._nparts = 0
+  this._boy = boy
+
+  const parserCfg = {
+    boundary,
+    maxHeaderPairs: headerPairsLimit,
+    maxHeaderSize: headerSizeLimit,
+    partHwm: fileOpts.highWaterMark,
+    highWaterMark: cfg.highWaterMark
+  }
+
+  this.parser = new Dicer(parserCfg)
+  this.parser.on('drain', function () {
+    self._needDrain = false
+    if (self._cb && !self._pause) {
+      const cb = self._cb
+      self._cb = undefined
+      cb()
+    }
+  }).on('part', function onPart (part) {
+    if (++self._nparts > partsLimit) {
+      self.parser.removeListener('part', onPart)
+      self.parser.on('part', skipPart)
+      boy.hitPartsLimit = true
+      boy.emit('partsLimit')
+      return skipPart(part)
+    }
+
+    // hack because streams2 _always_ doesn't emit 'end' until nextTick, so let
+    // us emit 'end' early since we know the part has ended if we are already
+    // seeing the next part
+    if (curField) {
+      const field = curField
+      field.emit('end')
+      field.removeAllListeners('end')
+    }
+
+    part.on('header', function (header) {
+      let contype
+      let fieldname
+      let parsed
+      let charset
+      let encoding
+      let filename
+      let nsize = 0
+
+      if (header['content-type']) {
+        parsed = parseParams(header['content-type'][0])
+        if (parsed[0]) {
+          contype = parsed[0].toLowerCase()
+          for (i = 0, len = parsed.length; i < len; ++i) {
+            if (RE_CHARSET.test(parsed[i][0])) {
+              charset = parsed[i][1].toLowerCase()
+              break
+            }
+          }
+        }
+      }
+
+      if (contype === undefined) { contype = 'text/plain' }
+      if (charset === undefined) { charset = defCharset }
+
+      if (header['content-disposition']) {
+        parsed = parseParams(header['content-disposition'][0])
+        if (!RE_FIELD.test(parsed[0])) { return skipPart(part) }
+        for (i = 0, len = parsed.length; i < len; ++i) {
+          if (RE_NAME.test(parsed[i][0])) {
+            fieldname = parsed[i][1]
+          } else if (RE_FILENAME.test(parsed[i][0])) {
+            filename = parsed[i][1]
+            if (!preservePath) { filename = basename(filename) }
+          }
+        }
+      } else { return skipPart(part) }
+
+      if (header['content-transfer-encoding']) { encoding = header['content-transfer-encoding'][0].toLowerCase() } else { encoding = '7bit' }
+
+      let onData,
+        onEnd
+
+      if (isPartAFile(fieldname, contype, filename)) {
+        // file/binary field
+        if (nfiles === filesLimit) {
+          if (!boy.hitFilesLimit) {
+            boy.hitFilesLimit = true
+            boy.emit('filesLimit')
+          }
+          return skipPart(part)
+        }
+
+        ++nfiles
+
+        if (!boy._events.file) {
+          self.parser._ignore()
+          return
+        }
+
+        ++nends
+        const file = new FileStream(fileOpts)
+        curFile = file
+        file.on('end', function () {
+          --nends
+          self._pause = false
+          checkFinished()
+          if (self._cb && !self._needDrain) {
+            const cb = self._cb
+            self._cb = undefined
+            cb()
+          }
+        })
+        file._read = function (n) {
+          if (!self._pause) { return }
+          self._pause = false
+          if (self._cb && !self._needDrain) {
+            const cb = self._cb
+            self._cb = undefined
+            cb()
+          }
+        }
+        boy.emit('file', fieldname, file, filename, encoding, contype)
+
+        onData = function (data) {
+          if ((nsize += data.length) > fileSizeLimit) {
+            const extralen = fileSizeLimit - nsize + data.length
+            if (extralen > 0) { file.push(data.slice(0, extralen)) }
+            file.truncated = true
+            file.bytesRead = fileSizeLimit
+            part.removeAllListeners('data')
+            file.emit('limit')
+            return
+          } else if (!file.push(data)) { self._pause = true }
+
+          file.bytesRead = nsize
+        }
+
+        onEnd = function () {
+          curFile = undefined
+          file.push(null)
+        }
+      } else {
+        // non-file field
+        if (nfields === fieldsLimit) {
+          if (!boy.hitFieldsLimit) {
+            boy.hitFieldsLimit = true
+            boy.emit('fieldsLimit')
+          }
+          return skipPart(part)
+        }
+
+        ++nfields
+        ++nends
+        let buffer = ''
+        let truncated = false
+        curField = part
+
+        onData = function (data) {
+          if ((nsize += data.length) > fieldSizeLimit) {
+            const extralen = (fieldSizeLimit - (nsize - data.length))
+            buffer += data.toString('binary', 0, extralen)
+            truncated = true
+            part.removeAllListeners('data')
+          } else { buffer += data.toString('binary') }
+        }
+
+        onEnd = function () {
+          curField = undefined
+          if (buffer.length) { buffer = decodeText(buffer, 'binary', charset) }
+          boy.emit('field', fieldname, buffer, false, truncated, encoding, contype)
+          --nends
+          checkFinished()
+        }
+      }
+
+      /* As of node@2efe4ab761666 (v0.10.29+/v0.11.14+), busboy had become
+         broken. Streams2/streams3 is a huge black box of confusion, but
+         somehow overriding the sync state seems to fix things again (and still
+         seems to work for previous node versions).
+      */
+      part._readableState.sync = false
+
+      part.on('data', onData)
+      part.on('end', onEnd)
+    }).on('error', function (err) {
+      if (curFile) { curFile.emit('error', err) }
+    })
+  }).on('error', function (err) {
+    boy.emit('error', err)
+  }).on('finish', function () {
+    finished = true
+    checkFinished()
+  })
+}
+
+Multipart.prototype.write = function (chunk, cb) {
+  const r = this.parser.write(chunk)
+  if (r && !this._pause) {
+    cb()
+  } else {
+    this._needDrain = !r
+    this._cb = cb
+  }
+}
+
+Multipart.prototype.end = function () {
+  const self = this
+
+  if (self.parser.writable) {
+    self.parser.end()
+  } else if (!self._boy._done) {
+    process.nextTick(function () {
+      self._boy._done = true
+      self._boy.emit('finish')
+    })
+  }
+}
+
+function skipPart (part) {
+  part.resume()
+}
+
+function FileStream (opts) {
+  Readable.call(this, opts)
+
+  this.bytesRead = 0
+
+  this.truncated = false
+}
+
+inherits(FileStream, Readable)
+
+FileStream.prototype._read = function (n) {}
+
+module.exports = Multipart
+
+
+/***/ }),
+
+/***/ 78306:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+const Decoder = __nccwpck_require__(27100)
+const decodeText = __nccwpck_require__(84619)
+const getLimit = __nccwpck_require__(21467)
+
+const RE_CHARSET = /^charset$/i
+
+UrlEncoded.detect = /^application\/x-www-form-urlencoded/i
+function UrlEncoded (boy, cfg) {
+  const limits = cfg.limits
+  const parsedConType = cfg.parsedConType
+  this.boy = boy
+
+  this.fieldSizeLimit = getLimit(limits, 'fieldSize', 1 * 1024 * 1024)
+  this.fieldNameSizeLimit = getLimit(limits, 'fieldNameSize', 100)
+  this.fieldsLimit = getLimit(limits, 'fields', Infinity)
+
+  let charset
+  for (var i = 0, len = parsedConType.length; i < len; ++i) { // eslint-disable-line no-var
+    if (Array.isArray(parsedConType[i]) &&
+        RE_CHARSET.test(parsedConType[i][0])) {
+      charset = parsedConType[i][1].toLowerCase()
+      break
+    }
+  }
+
+  if (charset === undefined) { charset = cfg.defCharset || 'utf8' }
+
+  this.decoder = new Decoder()
+  this.charset = charset
+  this._fields = 0
+  this._state = 'key'
+  this._checkingBytes = true
+  this._bytesKey = 0
+  this._bytesVal = 0
+  this._key = ''
+  this._val = ''
+  this._keyTrunc = false
+  this._valTrunc = false
+  this._hitLimit = false
+}
+
+UrlEncoded.prototype.write = function (data, cb) {
+  if (this._fields === this.fieldsLimit) {
+    if (!this.boy.hitFieldsLimit) {
+      this.boy.hitFieldsLimit = true
+      this.boy.emit('fieldsLimit')
+    }
+    return cb()
+  }
+
+  let idxeq; let idxamp; let i; let p = 0; const len = data.length
+
+  while (p < len) {
+    if (this._state === 'key') {
+      idxeq = idxamp = undefined
+      for (i = p; i < len; ++i) {
+        if (!this._checkingBytes) { ++p }
+        if (data[i] === 0x3D/* = */) {
+          idxeq = i
+          break
+        } else if (data[i] === 0x26/* & */) {
+          idxamp = i
+          break
+        }
+        if (this._checkingBytes && this._bytesKey === this.fieldNameSizeLimit) {
+          this._hitLimit = true
+          break
+        } else if (this._checkingBytes) { ++this._bytesKey }
+      }
+
+      if (idxeq !== undefined) {
+        // key with assignment
+        if (idxeq > p) { this._key += this.decoder.write(data.toString('binary', p, idxeq)) }
+        this._state = 'val'
+
+        this._hitLimit = false
+        this._checkingBytes = true
+        this._val = ''
+        this._bytesVal = 0
+        this._valTrunc = false
+        this.decoder.reset()
+
+        p = idxeq + 1
+      } else if (idxamp !== undefined) {
+        // key with no assignment
+        ++this._fields
+        let key; const keyTrunc = this._keyTrunc
+        if (idxamp > p) { key = (this._key += this.decoder.write(data.toString('binary', p, idxamp))) } else { key = this._key }
+
+        this._hitLimit = false
+        this._checkingBytes = true
+        this._key = ''
+        this._bytesKey = 0
+        this._keyTrunc = false
+        this.decoder.reset()
+
+        if (key.length) {
+          this.boy.emit('field', decodeText(key, 'binary', this.charset),
+            '',
+            keyTrunc,
+            false)
+        }
+
+        p = idxamp + 1
+        if (this._fields === this.fieldsLimit) { return cb() }
+      } else if (this._hitLimit) {
+        // we may not have hit the actual limit if there are encoded bytes...
+        if (i > p) { this._key += this.decoder.write(data.toString('binary', p, i)) }
+        p = i
+        if ((this._bytesKey = this._key.length) === this.fieldNameSizeLimit) {
+          // yep, we actually did hit the limit
+          this._checkingBytes = false
+          this._keyTrunc = true
+        }
+      } else {
+        if (p < len) { this._key += this.decoder.write(data.toString('binary', p)) }
+        p = len
+      }
+    } else {
+      idxamp = undefined
+      for (i = p; i < len; ++i) {
+        if (!this._checkingBytes) { ++p }
+        if (data[i] === 0x26/* & */) {
+          idxamp = i
+          break
+        }
+        if (this._checkingBytes && this._bytesVal === this.fieldSizeLimit) {
+          this._hitLimit = true
+          break
+        } else if (this._checkingBytes) { ++this._bytesVal }
+      }
+
+      if (idxamp !== undefined) {
+        ++this._fields
+        if (idxamp > p) { this._val += this.decoder.write(data.toString('binary', p, idxamp)) }
+        this.boy.emit('field', decodeText(this._key, 'binary', this.charset),
+          decodeText(this._val, 'binary', this.charset),
+          this._keyTrunc,
+          this._valTrunc)
+        this._state = 'key'
+
+        this._hitLimit = false
+        this._checkingBytes = true
+        this._key = ''
+        this._bytesKey = 0
+        this._keyTrunc = false
+        this.decoder.reset()
+
+        p = idxamp + 1
+        if (this._fields === this.fieldsLimit) { return cb() }
+      } else if (this._hitLimit) {
+        // we may not have hit the actual limit if there are encoded bytes...
+        if (i > p) { this._val += this.decoder.write(data.toString('binary', p, i)) }
+        p = i
+        if ((this._val === '' && this.fieldSizeLimit === 0) ||
+            (this._bytesVal = this._val.length) === this.fieldSizeLimit) {
+          // yep, we actually did hit the limit
+          this._checkingBytes = false
+          this._valTrunc = true
+        }
+      } else {
+        if (p < len) { this._val += this.decoder.write(data.toString('binary', p)) }
+        p = len
+      }
+    }
+  }
+  cb()
+}
+
+UrlEncoded.prototype.end = function () {
+  if (this.boy._done) { return }
+
+  if (this._state === 'key' && this._key.length > 0) {
+    this.boy.emit('field', decodeText(this._key, 'binary', this.charset),
+      '',
+      this._keyTrunc,
+      false)
+  } else if (this._state === 'val') {
+    this.boy.emit('field', decodeText(this._key, 'binary', this.charset),
+      decodeText(this._val, 'binary', this.charset),
+      this._keyTrunc,
+      this._valTrunc)
+  }
+  this.boy._done = true
+  this.boy.emit('finish')
+}
+
+module.exports = UrlEncoded
+
+
+/***/ }),
+
+/***/ 27100:
+/***/ ((module) => {
+
+"use strict";
+
+
+const RE_PLUS = /\+/g
+
+const HEX = [
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0,
+  0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+function Decoder () {
+  this.buffer = undefined
+}
+Decoder.prototype.write = function (str) {
+  // Replace '+' with ' ' before decoding
+  str = str.replace(RE_PLUS, ' ')
+  let res = ''
+  let i = 0; let p = 0; const len = str.length
+  for (; i < len; ++i) {
+    if (this.buffer !== undefined) {
+      if (!HEX[str.charCodeAt(i)]) {
+        res += '%' + this.buffer
+        this.buffer = undefined
+        --i // retry character
+      } else {
+        this.buffer += str[i]
+        ++p
+        if (this.buffer.length === 2) {
+          res += String.fromCharCode(parseInt(this.buffer, 16))
+          this.buffer = undefined
+        }
+      }
+    } else if (str[i] === '%') {
+      if (i > p) {
+        res += str.substring(p, i)
+        p = i
+      }
+      this.buffer = ''
+      ++p
+    }
+  }
+  if (p < len && this.buffer === undefined) { res += str.substring(p) }
+  return res
+}
+Decoder.prototype.reset = function () {
+  this.buffer = undefined
+}
+
+module.exports = Decoder
+
+
+/***/ }),
+
+/***/ 48647:
+/***/ ((module) => {
+
+"use strict";
+
+
+module.exports = function basename (path) {
+  if (typeof path !== 'string') { return '' }
+  for (var i = path.length - 1; i >= 0; --i) { // eslint-disable-line no-var
+    switch (path.charCodeAt(i)) {
+      case 0x2F: // '/'
+      case 0x5C: // '\'
+        path = path.slice(i + 1)
+        return (path === '..' || path === '.' ? '' : path)
+    }
+  }
+  return (path === '..' || path === '.' ? '' : path)
+}
+
+
+/***/ }),
+
+/***/ 84619:
+/***/ (function(module) {
+
+"use strict";
+
+
+// Node has always utf-8
+const utf8Decoder = new TextDecoder('utf-8')
+const textDecoders = new Map([
+  ['utf-8', utf8Decoder],
+  ['utf8', utf8Decoder]
+])
+
+function getDecoder (charset) {
+  let lc
+  while (true) {
+    switch (charset) {
+      case 'utf-8':
+      case 'utf8':
+        return decoders.utf8
+      case 'latin1':
+      case 'ascii': // TODO: Make these a separate, strict decoder?
+      case 'us-ascii':
+      case 'iso-8859-1':
+      case 'iso8859-1':
+      case 'iso88591':
+      case 'iso_8859-1':
+      case 'windows-1252':
+      case 'iso_8859-1:1987':
+      case 'cp1252':
+      case 'x-cp1252':
+        return decoders.latin1
+      case 'utf16le':
+      case 'utf-16le':
+      case 'ucs2':
+      case 'ucs-2':
+        return decoders.utf16le
+      case 'base64':
+        return decoders.base64
+      default:
+        if (lc === undefined) {
+          lc = true
+          charset = charset.toLowerCase()
+          continue
+        }
+        return decoders.other.bind(charset)
+    }
+  }
+}
+
+const decoders = {
+  utf8: (data, sourceEncoding) => {
+    if (data.length === 0) {
+      return ''
+    }
+    if (typeof data === 'string') {
+      data = Buffer.from(data, sourceEncoding)
+    }
+    return data.utf8Slice(0, data.length)
+  },
+
+  latin1: (data, sourceEncoding) => {
+    if (data.length === 0) {
+      return ''
+    }
+    if (typeof data === 'string') {
+      return data
+    }
+    return data.latin1Slice(0, data.length)
+  },
+
+  utf16le: (data, sourceEncoding) => {
+    if (data.length === 0) {
+      return ''
+    }
+    if (typeof data === 'string') {
+      data = Buffer.from(data, sourceEncoding)
+    }
+    return data.ucs2Slice(0, data.length)
+  },
+
+  base64: (data, sourceEncoding) => {
+    if (data.length === 0) {
+      return ''
+    }
+    if (typeof data === 'string') {
+      data = Buffer.from(data, sourceEncoding)
+    }
+    return data.base64Slice(0, data.length)
+  },
+
+  other: (data, sourceEncoding) => {
+    if (data.length === 0) {
+      return ''
+    }
+    if (typeof data === 'string') {
+      data = Buffer.from(data, sourceEncoding)
+    }
+
+    if (textDecoders.has(this.toString())) {
+      try {
+        return textDecoders.get(this).decode(data)
+      } catch (e) { }
+    }
+    return typeof data === 'string'
+      ? data
+      : data.toString()
+  }
+}
+
+function decodeText (text, sourceEncoding, destEncoding) {
+  if (text) {
+    return getDecoder(destEncoding)(text, sourceEncoding)
+  }
+  return text
+}
+
+module.exports = decodeText
+
+
+/***/ }),
+
+/***/ 21467:
+/***/ ((module) => {
+
+"use strict";
+
+
+module.exports = function getLimit (limits, name, defaultLimit) {
+  if (
+    !limits ||
+    limits[name] === undefined ||
+    limits[name] === null
+  ) { return defaultLimit }
+
+  if (
+    typeof limits[name] !== 'number' ||
+    isNaN(limits[name])
+  ) { throw new TypeError('Limit ' + name + ' is not a valid number') }
+
+  return limits[name]
+}
+
+
+/***/ }),
+
+/***/ 31854:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+/* eslint-disable object-property-newline */
+
+
+const decodeText = __nccwpck_require__(84619)
+
+const RE_ENCODED = /%[a-fA-F0-9][a-fA-F0-9]/g
+
+const EncodedLookup = {
+  '%00': '\x00', '%01': '\x01', '%02': '\x02', '%03': '\x03', '%04': '\x04',
+  '%05': '\x05', '%06': '\x06', '%07': '\x07', '%08': '\x08', '%09': '\x09',
+  '%0a': '\x0a', '%0A': '\x0a', '%0b': '\x0b', '%0B': '\x0b', '%0c': '\x0c',
+  '%0C': '\x0c', '%0d': '\x0d', '%0D': '\x0d', '%0e': '\x0e', '%0E': '\x0e',
+  '%0f': '\x0f', '%0F': '\x0f', '%10': '\x10', '%11': '\x11', '%12': '\x12',
+  '%13': '\x13', '%14': '\x14', '%15': '\x15', '%16': '\x16', '%17': '\x17',
+  '%18': '\x18', '%19': '\x19', '%1a': '\x1a', '%1A': '\x1a', '%1b': '\x1b',
+  '%1B': '\x1b', '%1c': '\x1c', '%1C': '\x1c', '%1d': '\x1d', '%1D': '\x1d',
+  '%1e': '\x1e', '%1E': '\x1e', '%1f': '\x1f', '%1F': '\x1f', '%20': '\x20',
+  '%21': '\x21', '%22': '\x22', '%23': '\x23', '%24': '\x24', '%25': '\x25',
+  '%26': '\x26', '%27': '\x27', '%28': '\x28', '%29': '\x29', '%2a': '\x2a',
+  '%2A': '\x2a', '%2b': '\x2b', '%2B': '\x2b', '%2c': '\x2c', '%2C': '\x2c',
+  '%2d': '\x2d', '%2D': '\x2d', '%2e': '\x2e', '%2E': '\x2e', '%2f': '\x2f',
+  '%2F': '\x2f', '%30': '\x30', '%31': '\x31', '%32': '\x32', '%33': '\x33',
+  '%34': '\x34', '%35': '\x35', '%36': '\x36', '%37': '\x37', '%38': '\x38',
+  '%39': '\x39', '%3a': '\x3a', '%3A': '\x3a', '%3b': '\x3b', '%3B': '\x3b',
+  '%3c': '\x3c', '%3C': '\x3c', '%3d': '\x3d', '%3D': '\x3d', '%3e': '\x3e',
+  '%3E': '\x3e', '%3f': '\x3f', '%3F': '\x3f', '%40': '\x40', '%41': '\x41',
+  '%42': '\x42', '%43': '\x43', '%44': '\x44', '%45': '\x45', '%46': '\x46',
+  '%47': '\x47', '%48': '\x48', '%49': '\x49', '%4a': '\x4a', '%4A': '\x4a',
+  '%4b': '\x4b', '%4B': '\x4b', '%4c': '\x4c', '%4C': '\x4c', '%4d': '\x4d',
+  '%4D': '\x4d', '%4e': '\x4e', '%4E': '\x4e', '%4f': '\x4f', '%4F': '\x4f',
+  '%50': '\x50', '%51': '\x51', '%52': '\x52', '%53': '\x53', '%54': '\x54',
+  '%55': '\x55', '%56': '\x56', '%57': '\x57', '%58': '\x58', '%59': '\x59',
+  '%5a': '\x5a', '%5A': '\x5a', '%5b': '\x5b', '%5B': '\x5b', '%5c': '\x5c',
+  '%5C': '\x5c', '%5d': '\x5d', '%5D': '\x5d', '%5e': '\x5e', '%5E': '\x5e',
+  '%5f': '\x5f', '%5F': '\x5f', '%60': '\x60', '%61': '\x61', '%62': '\x62',
+  '%63': '\x63', '%64': '\x64', '%65': '\x65', '%66': '\x66', '%67': '\x67',
+  '%68': '\x68', '%69': '\x69', '%6a': '\x6a', '%6A': '\x6a', '%6b': '\x6b',
+  '%6B': '\x6b', '%6c': '\x6c', '%6C': '\x6c', '%6d': '\x6d', '%6D': '\x6d',
+  '%6e': '\x6e', '%6E': '\x6e', '%6f': '\x6f', '%6F': '\x6f', '%70': '\x70',
+  '%71': '\x71', '%72': '\x72', '%73': '\x73', '%74': '\x74', '%75': '\x75',
+  '%76': '\x76', '%77': '\x77', '%78': '\x78', '%79': '\x79', '%7a': '\x7a',
+  '%7A': '\x7a', '%7b': '\x7b', '%7B': '\x7b', '%7c': '\x7c', '%7C': '\x7c',
+  '%7d': '\x7d', '%7D': '\x7d', '%7e': '\x7e', '%7E': '\x7e', '%7f': '\x7f',
+  '%7F': '\x7f', '%80': '\x80', '%81': '\x81', '%82': '\x82', '%83': '\x83',
+  '%84': '\x84', '%85': '\x85', '%86': '\x86', '%87': '\x87', '%88': '\x88',
+  '%89': '\x89', '%8a': '\x8a', '%8A': '\x8a', '%8b': '\x8b', '%8B': '\x8b',
+  '%8c': '\x8c', '%8C': '\x8c', '%8d': '\x8d', '%8D': '\x8d', '%8e': '\x8e',
+  '%8E': '\x8e', '%8f': '\x8f', '%8F': '\x8f', '%90': '\x90', '%91': '\x91',
+  '%92': '\x92', '%93': '\x93', '%94': '\x94', '%95': '\x95', '%96': '\x96',
+  '%97': '\x97', '%98': '\x98', '%99': '\x99', '%9a': '\x9a', '%9A': '\x9a',
+  '%9b': '\x9b', '%9B': '\x9b', '%9c': '\x9c', '%9C': '\x9c', '%9d': '\x9d',
+  '%9D': '\x9d', '%9e': '\x9e', '%9E': '\x9e', '%9f': '\x9f', '%9F': '\x9f',
+  '%a0': '\xa0', '%A0': '\xa0', '%a1': '\xa1', '%A1': '\xa1', '%a2': '\xa2',
+  '%A2': '\xa2', '%a3': '\xa3', '%A3': '\xa3', '%a4': '\xa4', '%A4': '\xa4',
+  '%a5': '\xa5', '%A5': '\xa5', '%a6': '\xa6', '%A6': '\xa6', '%a7': '\xa7',
+  '%A7': '\xa7', '%a8': '\xa8', '%A8': '\xa8', '%a9': '\xa9', '%A9': '\xa9',
+  '%aa': '\xaa', '%Aa': '\xaa', '%aA': '\xaa', '%AA': '\xaa', '%ab': '\xab',
+  '%Ab': '\xab', '%aB': '\xab', '%AB': '\xab', '%ac': '\xac', '%Ac': '\xac',
+  '%aC': '\xac', '%AC': '\xac', '%ad': '\xad', '%Ad': '\xad', '%aD': '\xad',
+  '%AD': '\xad', '%ae': '\xae', '%Ae': '\xae', '%aE': '\xae', '%AE': '\xae',
+  '%af': '\xaf', '%Af': '\xaf', '%aF': '\xaf', '%AF': '\xaf', '%b0': '\xb0',
+  '%B0': '\xb0', '%b1': '\xb1', '%B1': '\xb1', '%b2': '\xb2', '%B2': '\xb2',
+  '%b3': '\xb3', '%B3': '\xb3', '%b4': '\xb4', '%B4': '\xb4', '%b5': '\xb5',
+  '%B5': '\xb5', '%b6': '\xb6', '%B6': '\xb6', '%b7': '\xb7', '%B7': '\xb7',
+  '%b8': '\xb8', '%B8': '\xb8', '%b9': '\xb9', '%B9': '\xb9', '%ba': '\xba',
+  '%Ba': '\xba', '%bA': '\xba', '%BA': '\xba', '%bb': '\xbb', '%Bb': '\xbb',
+  '%bB': '\xbb', '%BB': '\xbb', '%bc': '\xbc', '%Bc': '\xbc', '%bC': '\xbc',
+  '%BC': '\xbc', '%bd': '\xbd', '%Bd': '\xbd', '%bD': '\xbd', '%BD': '\xbd',
+  '%be': '\xbe', '%Be': '\xbe', '%bE': '\xbe', '%BE': '\xbe', '%bf': '\xbf',
+  '%Bf': '\xbf', '%bF': '\xbf', '%BF': '\xbf', '%c0': '\xc0', '%C0': '\xc0',
+  '%c1': '\xc1', '%C1': '\xc1', '%c2': '\xc2', '%C2': '\xc2', '%c3': '\xc3',
+  '%C3': '\xc3', '%c4': '\xc4', '%C4': '\xc4', '%c5': '\xc5', '%C5': '\xc5',
+  '%c6': '\xc6', '%C6': '\xc6', '%c7': '\xc7', '%C7': '\xc7', '%c8': '\xc8',
+  '%C8': '\xc8', '%c9': '\xc9', '%C9': '\xc9', '%ca': '\xca', '%Ca': '\xca',
+  '%cA': '\xca', '%CA': '\xca', '%cb': '\xcb', '%Cb': '\xcb', '%cB': '\xcb',
+  '%CB': '\xcb', '%cc': '\xcc', '%Cc': '\xcc', '%cC': '\xcc', '%CC': '\xcc',
+  '%cd': '\xcd', '%Cd': '\xcd', '%cD': '\xcd', '%CD': '\xcd', '%ce': '\xce',
+  '%Ce': '\xce', '%cE': '\xce', '%CE': '\xce', '%cf': '\xcf', '%Cf': '\xcf',
+  '%cF': '\xcf', '%CF': '\xcf', '%d0': '\xd0', '%D0': '\xd0', '%d1': '\xd1',
+  '%D1': '\xd1', '%d2': '\xd2', '%D2': '\xd2', '%d3': '\xd3', '%D3': '\xd3',
+  '%d4': '\xd4', '%D4': '\xd4', '%d5': '\xd5', '%D5': '\xd5', '%d6': '\xd6',
+  '%D6': '\xd6', '%d7': '\xd7', '%D7': '\xd7', '%d8': '\xd8', '%D8': '\xd8',
+  '%d9': '\xd9', '%D9': '\xd9', '%da': '\xda', '%Da': '\xda', '%dA': '\xda',
+  '%DA': '\xda', '%db': '\xdb', '%Db': '\xdb', '%dB': '\xdb', '%DB': '\xdb',
+  '%dc': '\xdc', '%Dc': '\xdc', '%dC': '\xdc', '%DC': '\xdc', '%dd': '\xdd',
+  '%Dd': '\xdd', '%dD': '\xdd', '%DD': '\xdd', '%de': '\xde', '%De': '\xde',
+  '%dE': '\xde', '%DE': '\xde', '%df': '\xdf', '%Df': '\xdf', '%dF': '\xdf',
+  '%DF': '\xdf', '%e0': '\xe0', '%E0': '\xe0', '%e1': '\xe1', '%E1': '\xe1',
+  '%e2': '\xe2', '%E2': '\xe2', '%e3': '\xe3', '%E3': '\xe3', '%e4': '\xe4',
+  '%E4': '\xe4', '%e5': '\xe5', '%E5': '\xe5', '%e6': '\xe6', '%E6': '\xe6',
+  '%e7': '\xe7', '%E7': '\xe7', '%e8': '\xe8', '%E8': '\xe8', '%e9': '\xe9',
+  '%E9': '\xe9', '%ea': '\xea', '%Ea': '\xea', '%eA': '\xea', '%EA': '\xea',
+  '%eb': '\xeb', '%Eb': '\xeb', '%eB': '\xeb', '%EB': '\xeb', '%ec': '\xec',
+  '%Ec': '\xec', '%eC': '\xec', '%EC': '\xec', '%ed': '\xed', '%Ed': '\xed',
+  '%eD': '\xed', '%ED': '\xed', '%ee': '\xee', '%Ee': '\xee', '%eE': '\xee',
+  '%EE': '\xee', '%ef': '\xef', '%Ef': '\xef', '%eF': '\xef', '%EF': '\xef',
+  '%f0': '\xf0', '%F0': '\xf0', '%f1': '\xf1', '%F1': '\xf1', '%f2': '\xf2',
+  '%F2': '\xf2', '%f3': '\xf3', '%F3': '\xf3', '%f4': '\xf4', '%F4': '\xf4',
+  '%f5': '\xf5', '%F5': '\xf5', '%f6': '\xf6', '%F6': '\xf6', '%f7': '\xf7',
+  '%F7': '\xf7', '%f8': '\xf8', '%F8': '\xf8', '%f9': '\xf9', '%F9': '\xf9',
+  '%fa': '\xfa', '%Fa': '\xfa', '%fA': '\xfa', '%FA': '\xfa', '%fb': '\xfb',
+  '%Fb': '\xfb', '%fB': '\xfb', '%FB': '\xfb', '%fc': '\xfc', '%Fc': '\xfc',
+  '%fC': '\xfc', '%FC': '\xfc', '%fd': '\xfd', '%Fd': '\xfd', '%fD': '\xfd',
+  '%FD': '\xfd', '%fe': '\xfe', '%Fe': '\xfe', '%fE': '\xfe', '%FE': '\xfe',
+  '%ff': '\xff', '%Ff': '\xff', '%fF': '\xff', '%FF': '\xff'
+}
+
+function encodedReplacer (match) {
+  return EncodedLookup[match]
+}
+
+const STATE_KEY = 0
+const STATE_VALUE = 1
+const STATE_CHARSET = 2
+const STATE_LANG = 3
+
+function parseParams (str) {
+  const res = []
+  let state = STATE_KEY
+  let charset = ''
+  let inquote = false
+  let escaping = false
+  let p = 0
+  let tmp = ''
+  const len = str.length
+
+  for (var i = 0; i < len; ++i) { // eslint-disable-line no-var
+    const char = str[i]
+    if (char === '\\' && inquote) {
+      if (escaping) { escaping = false } else {
+        escaping = true
+        continue
+      }
+    } else if (char === '"') {
+      if (!escaping) {
+        if (inquote) {
+          inquote = false
+          state = STATE_KEY
+        } else { inquote = true }
+        continue
+      } else { escaping = false }
+    } else {
+      if (escaping && inquote) { tmp += '\\' }
+      escaping = false
+      if ((state === STATE_CHARSET || state === STATE_LANG) && char === "'") {
+        if (state === STATE_CHARSET) {
+          state = STATE_LANG
+          charset = tmp.substring(1)
+        } else { state = STATE_VALUE }
+        tmp = ''
+        continue
+      } else if (state === STATE_KEY &&
+        (char === '*' || char === '=') &&
+        res.length) {
+        state = char === '*'
+          ? STATE_CHARSET
+          : STATE_VALUE
+        res[p] = [tmp, undefined]
+        tmp = ''
+        continue
+      } else if (!inquote && char === ';') {
+        state = STATE_KEY
+        if (charset) {
+          if (tmp.length) {
+            tmp = decodeText(tmp.replace(RE_ENCODED, encodedReplacer),
+              'binary',
+              charset)
+          }
+          charset = ''
+        } else if (tmp.length) {
+          tmp = decodeText(tmp, 'binary', 'utf8')
+        }
+        if (res[p] === undefined) { res[p] = tmp } else { res[p][1] = tmp }
+        tmp = ''
+        ++p
+        continue
+      } else if (!inquote && (char === ' ' || char === '\t')) { continue }
+    }
+    tmp += char
+  }
+  if (charset && tmp.length) {
+    tmp = decodeText(tmp.replace(RE_ENCODED, encodedReplacer),
+      'binary',
+      charset)
+  } else if (tmp) {
+    tmp = decodeText(tmp, 'binary', 'utf8')
+  }
+
+  if (res[p] === undefined) {
+    if (tmp) { res[p] = tmp }
+  } else { res[p][1] = tmp }
+
+  return res
+}
+
+module.exports = parseParams
+
 
 /***/ }),
 
